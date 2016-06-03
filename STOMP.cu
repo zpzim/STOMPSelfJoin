@@ -892,7 +892,9 @@ void* doThreadSTOMP(void* argsp){
     printf("Copying QTtrunc\n");
 
     time_t start2, now2;
+    time_t lastLogged;
     time(&start2);
+    time(&lastLogged);
     bool usingSecondary = true;
     bool fileOne = true;
    // cudaProfilerInitialize();
@@ -916,10 +918,14 @@ void* doThreadSTOMP(void* argsp){
 		{
 			reducemain(D, i+1, 2048, 1024, n-i-1, profile, profileIdxs, i, reduced_result, reduced_loc);
 		}
-
-	        if(LOG_FREQ != 0 && (i - start) % LOG_FREQ == 1){
-		        time(&now2);
-		        printf("Thread %d Spent %lf seconds since last save\n", tid, difftime(now2, start2));
+		 time(&now2);
+		 if((int) difftime(now2, start2) % 60 == 0 && difftime(now2,lastLogged) > 2){
+				printf("Thread %d finished iteration %u, %f percent iterations done: current total time taken = %lf seconds\n", tid, i, (i - start)/((float)(end - start)), difftime(now2, START) + oldTime);
+				time(&lastLogged);
+		}
+	        if(LOG_FREQ != 0 && difftime(now2, start2) > LOG_FREQ){
+		        
+		        //printf("Thread %d Spent %lf seconds since last save\n", tid, difftime(now2, start2));
 		        writeProgressToDisk(tid, profile, profileIdxs, QTtrunc2, i, difftime(now2, START) + oldTime);
 		        time(&start2);
 		    }
@@ -932,10 +938,15 @@ void* doThreadSTOMP(void* argsp){
 		{
 			reducemain(D, i+1, 2048, 1024, n-i-1, profile, profileIdxs, i, reduced_result, reduced_loc);
 		}
+		time(&now2);
 
-	        if(LOG_FREQ != 0 && (i - start) % LOG_FREQ == 1){
-		        time(&now2);
-		        printf("Thread %d Spent %lf seconds since last save\n",tid, difftime(now2, start2));
+                if((int) difftime(now2, start2) % 60 == 0 && difftime(now2,lastLogged) > 2){
+				printf("Thread %d finished iteration %u, %f percent iterations done: current total time taken = %lf seconds\n", tid, i, (i - start)/((float)(end - start)), difftime(now2, START) + oldTime);
+				time(&lastLogged);
+		}
+	        if(LOG_FREQ != 0 && difftime(now2, start2) > LOG_FREQ){
+		        //time(&now2);
+		        //printf("Thread %d Spent %lf seconds since last save\n",tid, difftime(now2, start2));
 		        writeProgressToDisk(tid, profile, profileIdxs, QTtrunc, i, difftime(now2, START) + oldTime);
 		        time(&start2);
 		    }
@@ -1058,7 +1069,7 @@ int main(int argc, char** argv) {
 	STOMP(Th,window_size,profile, profIdxs);
 	time(&now);
 	
-	printf("Finished STOMP on %u data points in %f seconds.\n", size, difftime(now, START));
+	printf("Finished STOMP on %u data points in %f seconds.\n", size, difftime(now, START) + );
 	printf("Now writing result to files\n");
 	//thrust::host_vector<DATA_TYPE> p = profile;
 	//printf("Copied profile back to host\n");
