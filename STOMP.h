@@ -41,6 +41,15 @@ struct square
 	}
 };
 
+struct squareroot
+{
+	__host__ __device__
+	double operator()(double x)
+	{
+		return sqrt(x);
+	}
+};
+
 //For element wise multiplication of complex values
 struct multiply
 {

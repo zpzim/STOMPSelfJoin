@@ -38,6 +38,7 @@ struct thread_args{
 	int exclusion;
 	int maxJoin;
 	int start, end;
+	int numWorkers;
 };
 
 struct thread_args targs[NUM_THREADS];
@@ -237,7 +238,7 @@ __global__ void CalculateDistProfile(DATA_TYPE* QT, DATA_TYPE* D, DATA_TYPE* Mea
 		D[a] = _MAX_VAL_;
 	}else if( a < n){
 	    //D[a] = sqrt(abs(2 * (m - (QT[a] - m * Means[a] * Qmean) / (stds[a] * Qstd))));
-		D[a] = sqrt(abs(2 * (m - (QT[a] - m * Means[a] * Qmean) / (stds[a] * Qstd))));
+		D[a] = abs(2 * (m - (QT[a] - m * Means[a] * Qmean) / (stds[a] * Qstd)));
 	}
 }
 
@@ -572,7 +573,6 @@ __global__ void Update(DATA_TYPE* QT, DATA_TYPE* QTtemp, DATA_TYPE* QTb, DATA_TY
 
 __host__ void SlidingDotProducts(const thrust::device_vector<DATA_TYPE>& Q, const thrust::device_vector<DATA_TYPE>& T, 	thrust::device_vector<DATA_TYPE>&  P, cufftHandle plan, cufftHandle plan2){		
 	int sz = T.size() * 2;
-	
 	printf("Starting FFT Forward 1\n");
 	thrust::device_vector<__CUFFT_TYPE__> Qrc(sz);
 	gpuErrchk( cudaPeekAtLastError() );
@@ -595,7 +595,7 @@ __host__ void SlidingDotProducts(const thrust::device_vector<DATA_TYPE>& Q, cons
 	printf("Allocating Tac\n");
 	thrust::device_vector<__CUFFT_TYPE__> Tac(sz);
 	printf("Allocating Ta\n");
-	thrust::device_vector<DATA_TYPE> Ta(T.size() * 2);
+	thrust::device_vector<DATA_TYPE> Ta(sz);
 	thrust::copy(T.begin(), T.end(), Ta.begin());
 	gpuErrchk( cudaPeekAtLastError() );
 	
@@ -751,6 +751,74 @@ void reducemain(thrust::device_vector<DATA_TYPE>& vd, unsigned int start_loc, un
 	}	
 }
 
+__device__ static inline double fatomicMin(double* address, double val)
+{
+    unsigned long long int* address_as_ull = (unsigned long long int*) address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+            __double_as_longlong(fmin(val, __longlong_as_double(assumed))));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+
+__global__ void WavefrontUpdateSelfJoin(DATA_TYPE* QT, DATA_TYPE* Ta, DATA_TYPE* Tb, DATA_TYPE* means, DATA_TYPE* stds, DATA_TYPE* profile, unsigned int *profileIdxs, unsigned int m, unsigned int n, int startPos, int endPos, unsigned int *counts, int numDevices){
+	int a = ((blockIdx.x * numDevices) + startPos) * blockDim.x + threadIdx.x;
+	const int b = ((blockIdx.x * numDevices) + startPos + 1) * blockDim.x;
+	//((blockIdx.x * blockDim.x + threadIdx.x) * numDevices) + startPos;
+	if((numDevices > 1 && a < b && a < n) || (numDevices == 1 && a < n))
+	{
+		int exclusion = m / 4;
+		double workspace = QT[a];
+		for(int x = a + 1, y = 1; x < n && y < n; ++x, ++y)
+		{
+			workspace = workspace - Ta[x - 1] * Tb[y - 1] + Ta[x + m - 1] * Tb[ y + m - 1];			
+			if(!(x > y - exclusion && x  < y + exclusion))
+			{			
+				double dist = abs(2 * (m - (workspace - m * means[x] * means[y]) / (stds[x] * stds[y])));
+				if(profile[x] > dist)
+				{
+					bool isSet = false; 
+					do 
+					{
+						if(isSet = atomicCAS(&counts[x], 0, 1) == 0) 
+						{
+							if(profile[x] > dist)
+							{
+								profile[x] = dist;
+								profileIdxs[x] = y;
+							}
+						}
+						if (isSet) 
+						{
+							counts[x] = 0;
+						}
+					}while(!isSet);
+				}
+				if(profile[y] > dist)
+				{
+					bool isSet = false; 
+					do 
+					{
+						if(isSet = atomicCAS(&counts[y], 0, 1) == 0) 
+						{
+							if(profile[y] > dist)
+							{
+								profile[y] = dist;
+								profileIdxs[y] = x;
+							}
+						}
+						if (isSet) 
+						{
+							counts[y] = 0;
+						}
+					}while(!isSet);
+				}			
+			}
+		}
+	}
+}
 
 //Performs STOMP algorithm
 void* doThreadSTOMP(void* argsp){
@@ -762,7 +830,7 @@ void* doThreadSTOMP(void* argsp){
  	thrust::device_vector<DATA_TYPE>* Tb = args -> Tb;
 	thrust::device_vector<DATA_TYPE>* profile = args -> profile;
 	thrust::device_vector<unsigned int>* profileIdxs = args -> profileIdxs;
-	
+	int numWorkers = args ->numWorkers;
 	int m = args -> m;
 	int exclusion = args -> exclusion;
 	int maxJoin = args -> maxJoin;
@@ -792,15 +860,17 @@ void* doThreadSTOMP(void* argsp){
 
 #ifndef __RESTARTING__
 
-    	printf("allocating Qa\n");
-	thrust::device_vector<DATA_TYPE> Qa(m), Qb(m);
+    	//printf("allocating Qa\n");
+	//thrust::device_vector<DATA_TYPE> Qa(m), Qb(m);
+	thrust::device_vector<DATA_TYPE> Qb(m);
 	gpuErrchk( cudaPeekAtLastError() );
 
-    	thrust::copy(thrust::cuda::par,Tb -> begin() + start, Tb -> begin() + start + m, Qb.begin());
+    	thrust::copy(thrust::cuda::par,Tb -> begin(), Tb -> begin() + m, Qb.begin());
     	gpuErrchk( cudaPeekAtLastError() );
-	thrust::copy(thrust::cuda::par,Ta -> begin(), Ta -> begin() + m, Qa.begin());
-	gpuErrchk( cudaPeekAtLastError() );
-	printf("allocating QT\n");
+	//thrust::copy(thrust::cuda::par,Ta -> begin(), Ta -> begin() + m, Qa.begin());
+	//gpuErrchk( cudaPeekAtLastError() );
+	
+	//printf("allocating QT\n");
 	thrust::device_vector<DATA_TYPE> QT;
 	
 	
@@ -815,18 +885,18 @@ void* doThreadSTOMP(void* argsp){
 	QT.clear();
 	QT.shrink_to_fit();
 	
-	SlidingDotProducts(Qa, *Tb, QT, plan[tid], plan2[tid]);
-	printf("allocating QTbtrunc\n");
-	thrust::device_vector<DATA_TYPE> QTbtrunc(n);
-	thrust::copy(thrust::cuda::par,QT.begin() + m - 1, QT.begin() + m + n - 1, QTbtrunc.begin());
+	//SlidingDotProducts(Qa, *Tb, QT, plan[tid], plan2[tid]);
+	//printf("allocating QTbtrunc\n");
+	//thrust::device_vector<DATA_TYPE> QTbtrunc(n);
+	//thrust::copy(thrust::cuda::par,QT.begin() + m - 1, QT.begin() + m + n - 1, QTbtrunc.begin());
 	
-	QT.clear();
-	QT.shrink_to_fit();
+	//QT.clear();
+	//QT.shrink_to_fit();
     
 	
 	printf("allocating Means/stds\n");
 	thrust::device_vector<DATA_TYPE> Means(n), stds(n), squares(Ta -> size()), sums(Ta -> size());
-	printf("allocating Means/stdsb\n");
+	//printf("allocating Means/stdsb\n");
 	thrust::inclusive_scan(Ta -> begin(),Ta -> end(),sums.begin(), op1);
 	thrust::transform_inclusive_scan(Ta -> begin(), Ta -> end(), squares.begin(), op2,op1);
 	slidingMean<<<grid, block>>>(sums.data().get(),m, n, Means.data().get());
@@ -843,17 +913,18 @@ void* doThreadSTOMP(void* argsp){
     	thrust::device_vector<DATA_TYPE> D;
     	D.resize(n,_MAX_VAL_);
 	
-    CalculateDistProfile<<<grid, block>>>(QTtrunc.data().get(), D.data().get(), Means.data().get(), stds.data().get(), m, start, n);
+    CalculateDistProfile<<<grid, block>>>(QTtrunc.data().get(), D.data().get(), Means.data().get(), stds.data().get(), m, 0, n);
 	gpuErrchk( cudaPeekAtLastError() );
 
 
     *profile = D;
     	
     //Initialize the indexes to the starting position
-	profileIdxs -> resize(n, start);
+	profileIdxs -> resize(n,0);
 	if (n>1)
-		reducemain(D, start+1, 2048, 1024, n-1-start, profile, profileIdxs, start, reduced_result, reduced_loc);
-    
+		reducemain(D, 1, 2048, 1024, n-1, profile, profileIdxs, 0, reduced_result, reduced_loc);
+    D.clear();
+    D.shrink_to_fit();
 #else
 
     //We are restarting, so allocate required variables and load data from files
@@ -887,9 +958,9 @@ void* doThreadSTOMP(void* argsp){
     
 #endif    
     
-    printf("Allocating QTtemp\n");
-    thrust::device_vector<DATA_TYPE> QTtrunc2(n);
-    printf("Copying QTtrunc\n");
+    //printf("Allocating QTtemp\n");
+    //thrust::device_vector<DATA_TYPE> QTtrunc2(n);
+    //printf("Copying QTtrunc\n");
 
     time_t start2, now2;
     time_t lastLogged;
@@ -898,7 +969,7 @@ void* doThreadSTOMP(void* argsp){
     bool usingSecondary = true;
     bool fileOne = true;
    // cudaProfilerInitialize();
-	for(unsigned int i = start + 1; i < end; ++i){// end; ++i){
+	/*for(unsigned int i = start + 1; i < end; ++i){// end; ++i){
 	    dim3 grid3_cur((n-i) / WORK_SIZE + 1, 1, 1);
 	    //Swap buffers every iteration so we don't have to copy anything explicitly.
 	    if(usingSecondary){
@@ -953,10 +1024,14 @@ void* doThreadSTOMP(void* argsp){
 		    usingSecondary = true;
 	    }
 		
-	}
+	}*/
+	thrust::device_vector<unsigned int> counts(n, 0);
+	WavefrontUpdateSelfJoin<<<dim3(ceil(numWorkers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1)>>>(QTtrunc.data().get(), Ta -> data().get(), Tb -> data().get(), Means.data().get(), stds.data().get(), profile -> data().get(), profileIdxs -> data().get(), m, n, start, end, counts.data().get(), NUM_THREADS);
+	cudaDeviceSynchronize();
+	//std::cout << thrust::reduce(counts.begin(), counts.end(), 0, thrust::plus<unsigned long long>()) << std::endl;	
 	time_t now3;
 	time(&now3);
-	printf("Finished thread %d over all iterations in %lf seconds\n", tid, difftime(now3, START) + oldTime);
+	printf("Finished thread %d over all iterations in %lf seconds\n", tid, difftime(now3, start2) + oldTime);
 	pthread_exit(0);
 }
 
@@ -970,12 +1045,12 @@ __host__ void STOMP(thrust::host_vector<DATA_TYPE>& Ta, unsigned int m,
 	thrust::device_vector<DATA_TYPE>* Ta_d = new thrust::device_vector<DATA_TYPE>[nDevices];
 	thrust::device_vector<DATA_TYPE>* Profs[NUM_THREADS];
 	thrust::device_vector<unsigned int>* ProfsIdxs[NUM_THREADS];
-	printf("HERE\n");
+	//printf("HERE\n");
 	for(int i = 0; i < nDevices; ++i){
 	    gpuErrchk(cudaSetDevice(i));
 	    Ta_d[i] = Ta; 
 	}
-	printf("HERE2\n");
+	//printf("HERE2\n");
 	for(int i = 0; i < NUM_THREADS; ++i){
 	    gpuErrchk(cudaSetDevice(i % nDevices));
 	    Profs[i] = new thrust::device_vector<DATA_TYPE>();
@@ -987,6 +1062,12 @@ __host__ void STOMP(thrust::host_vector<DATA_TYPE>& Ta, unsigned int m,
 	//unsigned int t_work_size = ceil(n / (double) NUM_THREADS);
 	unsigned int lastend=0;
 	for(unsigned int i = 0; i < NUM_THREADS; ++i ){
+		lastend += ceil(n / (double) NUM_THREADS);
+		if(lastend > n){
+			lastend = n;
+		}
+		int workers =  ceil(n / (double) NUM_THREADS);
+		std::cout << workers<< std::endl;
 		int tid = i;
 		targs[tid].Ta = &Ta_d[i % nDevices];
 		targs[tid].Tb = &Ta_d[i % nDevices];
@@ -994,10 +1075,11 @@ __host__ void STOMP(thrust::host_vector<DATA_TYPE>& Ta, unsigned int m,
 		targs[tid].profile = Profs[tid];
 		targs[tid].profileIdxs = ProfsIdxs[tid];
 		targs[tid].m = m;
-		targs[tid].start = lastend;
-		lastend = n-floor(n*sqrt(double(NUM_THREADS-i-1)/double(NUM_THREADS-i)));
+		targs[tid].start = i;
+		targs[tid].numWorkers = ceil(n / (double) NUM_THREADS);
+		//lastend = n-floor(n*sqrt(double(NUM_THREADS-i-1)/double(NUM_THREADS-i)));
 		printf("val:%lf\n", sqrt(double(NUM_THREADS-i-1)/double(NUM_THREADS-i)));
-		targs[tid].end = lastend;
+		targs[tid].end = n;
 		targs[tid].exclusion = m / 4;
 		targs[tid].maxJoin = 0;
 		printf("Launching thread %d, for start = %d, to end = %d\n", tid, targs[tid].start, targs[tid].end);
@@ -1032,10 +1114,11 @@ __host__ void STOMP(thrust::host_vector<DATA_TYPE>& Ta, unsigned int m,
 	}
 	//Compute final distance profile (Aggragate what each thread produced)
 	for(int i = 0; i < NUM_THREADS; ++i){
-		int curstart=targs[i].start;
-			thrust::for_each(thrust::make_zip_iterator(thrust::make_tuple(profile.begin() + curstart, Profs[i] -> begin() + curstart, profileIdxs.begin() + curstart, ProfsIdxs[i]->begin() + curstart)), thrust::make_zip_iterator(thrust::make_tuple(profile.end(), Profs[i] -> end(), profileIdxs.end(), ProfsIdxs[i] -> end())), minWithIndex2());
-			 gpuErrchk( cudaPeekAtLastError() );
+		int curstart=0;
+		thrust::for_each(thrust::make_zip_iterator(thrust::make_tuple(profile.begin() + curstart, Profs[i] -> begin() + curstart, profileIdxs.begin() + curstart, ProfsIdxs[i]->begin() + curstart)), thrust::make_zip_iterator(thrust::make_tuple(profile.end(), Profs[i] -> end(), profileIdxs.end(), ProfsIdxs[i] -> end())), minWithIndex2());
+		gpuErrchk( cudaPeekAtLastError() );
 	}
+	thrust::transform(profile.begin(), profile.end(), profile.begin(), squareroot());
     for(int i = 0; i < NUM_THREADS; ++i){
         printf("HELLO\n");
         delete Profs[i];
@@ -1069,7 +1152,7 @@ int main(int argc, char** argv) {
 	STOMP(Th,window_size,profile, profIdxs);
 	time(&now);
 	
-	printf("Finished STOMP on %u data points in %f seconds.\n", size, difftime(now, START) + );
+	printf("Finished STOMP on %u data points in %f seconds.\n", size, difftime(now, START));
 	printf("Now writing result to files\n");
 	//thrust::host_vector<DATA_TYPE> p = profile;
 	//printf("Copied profile back to host\n");
