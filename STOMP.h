@@ -30,6 +30,12 @@
 #define _MAX_VAL_ DBL_MAX
 #endif
 
+typedef union  {
+  float floats[2];                 // floats[0] = lowest
+  unsigned int ints[2];                     // ints[1] = lowIdx
+  unsigned long long int ulong;    // for atomic update
+} mp_entry;
+
 
 //For computing the prefix squared sum
 struct square
@@ -38,6 +44,17 @@ struct square
 	double operator()(double x)
 	{
 		return x * x;
+	}
+};
+
+struct MPIDXCombine
+{
+	__host__ __device__
+	unsigned long long int operator()(double x, unsigned int idx){
+		mp_entry item;
+		item.floats[0] = (float) x;
+		item.ints[1] = idx;
+		return item.ulong;
 	}
 };
 
@@ -98,10 +115,12 @@ struct minWithIndex2
 
 		// A[i] = min(A[i], B[i]);
 		// C[i] = A[i] == min(A[i], B[i]) ? i : C[i];
-
-		DATA_TYPE x = min(thrust::get<0>(t), thrust::get<1>(t));
-		thrust::get<0>(t) = x;
-		thrust::get<2>(t) = thrust::get<1>(t) == x ? thrust::get<3>(t) : thrust::get<2>(t);
+		mp_entry other;
+		other.ulong = thrust::get<2>(t);
+		if(thrust::get<0>(t) > other.floats[0]){
+			thrust::get<0>(t) = other.floats[0];
+			thrust::get<1>(t) = other.ints[1];
+		}
 
 	}
 };

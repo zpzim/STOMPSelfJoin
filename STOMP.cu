@@ -10,6 +10,7 @@
 #include <thrust/for_each.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/execution_policy.h>
+#include <thrust/extrema.h>
 #include <float.h>
 #include <pthread.h>
 #include <math.h>
@@ -32,7 +33,8 @@ const char * format_str_n = "%lf\n";
 time_t START;
 struct thread_args{
 	unsigned int tid;
-	thrust::device_vector<DATA_TYPE> *Ta, *Tb, *profile;
+	thrust::device_vector<DATA_TYPE> *Ta, *Tb;
+	thrust::device_vector<unsigned long long int> *profile;
 	thrust::device_vector<unsigned int> *profileIdxs;
 	unsigned int m;
 	int exclusion;
@@ -40,6 +42,11 @@ struct thread_args{
 	int start, end;
 	int numWorkers;
 };
+
+
+
+
+
 
 struct thread_args targs[NUM_THREADS];
 int nDevices;
@@ -238,7 +245,7 @@ __global__ void CalculateDistProfile(DATA_TYPE* QT, DATA_TYPE* D, DATA_TYPE* Mea
 		D[a] = _MAX_VAL_;
 	}else if( a < n){
 	    //D[a] = sqrt(abs(2 * (m - (QT[a] - m * Means[a] * Qmean) / (stds[a] * Qstd))));
-		D[a] = abs(2 * (m - (QT[a] - m * Means[a] * Qmean) / (stds[a] * Qstd)));
+		D[a] = sqrt(abs(2 * (m - (QT[a] - m * Means[a] * Qmean) / (stds[a] * Qstd))));
 	}
 }
 
@@ -751,73 +758,183 @@ void reducemain(thrust::device_vector<DATA_TYPE>& vd, unsigned int start_loc, un
 	}	
 }
 
-__device__ static inline double fatomicMin(double* address, double val)
+__device__ inline unsigned long long int MPatomicMin(volatile unsigned long long int* address, double val, unsigned int idx)
 {
-    unsigned long long int* address_as_ull = (unsigned long long int*) address;
-    unsigned long long int old = *address_as_ull, assumed;
-    do {
-        assumed = old;
-        old = atomicCAS(address_as_ull, assumed,
-            __double_as_longlong(fmin(val, __longlong_as_double(assumed))));
-    } while (assumed != old);
-    return __longlong_as_double(old);
+    float fval = (float)val;
+    mp_entry loc, loctest;
+    loc.floats[0] = (float) val;
+    loc.ints[1] = idx;
+    loctest.ulong = *address;
+    while (loctest.floats[0] > fval) 
+      loctest.ulong = atomicCAS((unsigned long long int*) address, loctest.ulong,  loc.ulong);
+	return loctest.ulong;
+	
+    //volatile unsigned long long int* address_as_ull = (volatile unsigned long long int*) address;
+    //volatile unsigned long long int old = *address_as_ull, assumed;
+    //do {
+    //    assumed = old;
+    //    old = atomicCAS((unsigned long long int*)address_as_ull, (unsigned long long int)assumed,
+    //        __double_as_longlong(fmin(val, __longlong_as_double(assumed))));
+    //} while (assumed != old);
+    //return __longlong_as_double(old);
 }
 
-__global__ void WavefrontUpdateSelfJoin(DATA_TYPE* QT, DATA_TYPE* Ta, DATA_TYPE* Tb, DATA_TYPE* means, DATA_TYPE* stds, DATA_TYPE* profile, unsigned int *profileIdxs, unsigned int m, unsigned int n, int startPos, int endPos, unsigned int *counts, int numDevices){
-	int a = ((blockIdx.x * numDevices) + startPos) * blockDim.x + threadIdx.x;
-	const int b = ((blockIdx.x * numDevices) + startPos + 1) * blockDim.x;
-	//((blockIdx.x * blockDim.x + threadIdx.x) * numDevices) + startPos;
-	if((numDevices > 1 && a < b && a < n) || (numDevices == 1 && a < n))
+
+__device__ void acquireLockUpdateMP(volatile DATA_TYPE* profile, unsigned int* profileIdxs, unsigned int* locks, double dist, int toCheck, int other){
+	bool isSet = false; 
+	do 
 	{
-		int exclusion = m / 4;
-		double workspace = QT[a];
-		for(int x = a + 1, y = 1; x < n && y < n; ++x, ++y)
+		if(isSet = atomicCAS(&locks[toCheck], 0, 1) == 0) 
 		{
-			workspace = workspace - Ta[x - 1] * Tb[y - 1] + Ta[x + m - 1] * Tb[ y + m - 1];			
-			if(!(x > y - exclusion && x  < y + exclusion))
-			{			
-				double dist = abs(2 * (m - (workspace - m * means[x] * means[y]) / (stds[x] * stds[y])));
-				if(profile[x] > dist)
-				{
-					bool isSet = false; 
-					do 
-					{
-						if(isSet = atomicCAS(&counts[x], 0, 1) == 0) 
-						{
-							if(profile[x] > dist)
-							{
-								profile[x] = dist;
-								profileIdxs[x] = y;
-							}
-						}
-						if (isSet) 
-						{
-							counts[x] = 0;
-						}
-					}while(!isSet);
-				}
-				if(profile[y] > dist)
-				{
-					bool isSet = false; 
-					do 
-					{
-						if(isSet = atomicCAS(&counts[y], 0, 1) == 0) 
-						{
-							if(profile[y] > dist)
-							{
-								profile[y] = dist;
-								profileIdxs[y] = x;
-							}
-						}
-						if (isSet) 
-						{
-							counts[y] = 0;
-						}
-					}while(!isSet);
-				}			
+			if(profile[toCheck] > dist)
+			{
+				profile[toCheck] = dist;
+				profileIdxs[toCheck] = other;
 			}
 		}
+		if (isSet) 
+		{
+			//locks[toCheck] = 0;
+			atomicExch(&locks[toCheck],0);
+		}
+	}while(!isSet);
+}
+
+
+
+__device__ inline void acquireLockUpdateMPGlobal(volatile unsigned long long* profile, unsigned int* profileIdxs, unsigned int* locks, volatile mp_entry* localMP, const int chunk, const int offset, const int n){
+	
+	__syncthreads();
+	if(threadIdx.x == 0){
+		while (atomicCAS(&locks[chunk], 0, 1) != 0);
 	}
+	__syncthreads();
+	int x = chunk*blockDim.x+threadIdx.x;
+	if(x < n && ((mp_entry*) profile)[x].floats[0] > localMP[threadIdx.x+offset].floats[0]){
+		profile[x] = localMP[threadIdx.x+offset].ulong;
+		//profileIdxs[x] = localIdxs[threadIdx.x+offset];
+	}
+	__syncthreads();
+	if(threadIdx.x == 0){
+		atomicExch(&locks[chunk], 0);
+	}
+	//__syncthreads();
+}
+
+__global__ void WavefrontUpdateSelfJoin(DATA_TYPE* QT, DATA_TYPE* Ta, DATA_TYPE* Tb, DATA_TYPE* means, DATA_TYPE* stds, volatile unsigned long long int* profile, unsigned int *profileIdxs, unsigned int m, unsigned int n, int startPos, int endPos, unsigned int *counts, int numDevices){
+	__shared__ volatile mp_entry localMPMain[WORK_SIZE * 2];
+	__shared__ volatile mp_entry localMPOther[WORK_SIZE];
+	//__shared__ volatile bool updated[3];
+
+
+	int a = ((blockIdx.x * numDevices) + startPos) * blockDim.x + threadIdx.x;
+	const int b = ((blockIdx.x * numDevices) + startPos + 1) * blockDim.x;
+	int exclusion = m / 4;
+	double workspace;
+	int localX = threadIdx.x + 1;
+	int localY = 1;
+	int chunkIdxMain = a / blockDim.x;
+	int chunkIdxOther = 0;
+	int mainStart = blockDim.x * chunkIdxMain;
+	int otherStart = 0;
+	if((numDevices > 1 && a < b && a < n) || (numDevices == 1 && a < n))
+	{
+		workspace = QT[a];
+		//Initialize Shared Data
+		if(mainStart+threadIdx.x < n){
+			localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
+		}else{
+			localMPMain[threadIdx.x].floats[0] = FLT_MAX;
+			localMPMain[threadIdx.x].ints[1] = 0;
+		}
+		if(mainStart+threadIdx.x+blockDim.x < n){
+			localMPMain[blockDim.x + threadIdx.x].ulong = profile[mainStart + blockDim.x + threadIdx.x];
+		}else{
+			localMPMain[blockDim.x + threadIdx.x].floats[0] = FLT_MAX;
+			localMPMain[blockDim.x + threadIdx.x].ints[1] = 0;
+		}
+		if(otherStart+threadIdx.x < n){
+			localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
+		}else{
+			localMPOther[threadIdx.x].floats[0] = FLT_MAX;
+			localMPOther[threadIdx.x].ints[1] = 0;
+		}
+	}
+	int x = a + 1;
+	int y = 1;
+	while(mainStart < n && otherStart < n)
+	{
+		__syncthreads();
+		while(x < n && y < n && localY < blockDim.x)
+		{
+			workspace = workspace - Ta[x - 1] * Tb[y - 1] + Ta[x + m - 1] * Tb[ y + m - 1];
+			if(!(x > y - exclusion && x < y + exclusion))
+			{
+				double dist = sqrt(abs(2 * (m - (workspace - m * means[x] * means[y]) / (stds[x] * stds[y]))));
+				
+				if(localMPMain[localX].floats[0] > dist)
+				{					
+					//acquireLockUpdateMP(localMPMain, localIdxsMain, localLocksMain, dist, localX, y);	
+					MPatomicMin(&profile[x], dist, y);
+					MPatomicMin((unsigned long long int*)&localMPMain[localX], dist, y);
+				}
+				if(localMPOther[localY].floats[0] > dist)
+				{
+					//acquireLockUpdateMP(localMPOther, localIdxsOther, localLocksOther, dist, localY, x);
+					MPatomicMin(&profile[y], dist, x);
+					MPatomicMin((unsigned long long int*)&localMPOther[localY], dist, x);
+				}
+			}			
+			++x;
+			++y;
+			++localX;
+			++localY;
+		}
+		__syncthreads();
+		//acquireLockUpdateMPGlobal(profile, profileIdxs, counts, localMPMain, chunkIdxMain, 0,n);
+		//acquireLockUpdateMPGlobal(profile, profileIdxs, counts, localMPMain, chunkIdxMain + 1, blockDim.x,n);
+		//acquireLockUpdateMPGlobal(profile, profileIdxs, counts, localMPOther, chunkIdxOther, 0,n);		
+		mainStart += blockDim.x;
+		otherStart += blockDim.x;
+		if((numDevices > 1 && a < b && a < n) || (numDevices == 1 && a < n))
+		{
+			if(mainStart+threadIdx.x < n)
+			{
+				localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
+			}
+			else
+			{
+				localMPMain[threadIdx.x].floats[0] = FLT_MAX;
+				localMPMain[threadIdx.x].ints[1] = 0;
+			}
+			if(mainStart+threadIdx.x+blockDim.x < n)
+			{
+				localMPMain[blockDim.x + threadIdx.x].ulong = profile[mainStart + blockDim.x + threadIdx.x];
+			}
+			else
+			{
+				localMPMain[threadIdx.x + blockDim.x].floats[0] = FLT_MAX;
+				localMPMain[threadIdx.x + blockDim.x].ints[1] = 0;
+			}
+			if(otherStart+threadIdx.x < n)
+			{
+				localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
+			}
+			else
+			{
+				localMPOther[threadIdx.x].floats[0] = FLT_MAX;
+				localMPOther[threadIdx.x].ints[1] = 0;
+			}	
+		}	
+		localY = 0;
+		localX = threadIdx.x;
+		chunkIdxMain++;
+		chunkIdxOther++;	
+	}
+	//__syncthreads();
+	//acquireLockUpdateMPGlobal(profile, profileIdxs, counts, localMPOther, chunkIdxOther, localIdxsOther, 0, n);
+	//acquireLockUpdateMPGlobal(profile, profileIdxs, counts, localMPMain, chunkIdxMain, localIdxsMain, 0, n);
+	//acquireLockUpdateMPGlobal(profile, profileIdxs, counts, localMPMain, chunkIdxMain+1, localIdxsMain, blockDim.x, n);
 }
 
 //Performs STOMP algorithm
@@ -828,7 +945,7 @@ void* doThreadSTOMP(void* argsp){
     	gpuErrchk(cudaSetDevice(tid % nDevices));
 	thrust::device_vector<DATA_TYPE>* Ta = args -> Ta;
  	thrust::device_vector<DATA_TYPE>* Tb = args -> Tb;
-	thrust::device_vector<DATA_TYPE>* profile = args -> profile;
+	thrust::device_vector<unsigned long long int>* profile = args -> profile;
 	thrust::device_vector<unsigned int>* profileIdxs = args -> profileIdxs;
 	int numWorkers = args ->numWorkers;
 	int m = args -> m;
@@ -916,13 +1033,22 @@ void* doThreadSTOMP(void* argsp){
     CalculateDistProfile<<<grid, block>>>(QTtrunc.data().get(), D.data().get(), Means.data().get(), stds.data().get(), m, 0, n);
 	gpuErrchk( cudaPeekAtLastError() );
 
-
-    *profile = D;
+	
+    //*profile = D;
     	
     //Initialize the indexes to the starting position
-	profileIdxs -> resize(n,0);
-	if (n>1)
-		reducemain(D, 1, 2048, 1024, n-1, profile, profileIdxs, 0, reduced_result, reduced_loc);
+	profileIdxs -> resize(n,1);
+	profile->resize(n, 0);
+	thrust::device_vector<double>::iterator it = thrust::min_element(D.begin(),D.end());
+	unsigned int pos = it - D.begin();
+	double val = *it;
+	//cout << pos << " " << val; 
+	(*profileIdxs)[0] = pos;
+	D[0] = *it;
+	thrust::transform(D.begin(), D.end(), profileIdxs->begin(), profile->begin(), MPIDXCombine());
+	//ComputeMPIDXProfile<<<grid, block>>>(profile,)
+	//if (n>1)
+	//	reducemain(D, 1, 2048, 1024, n-1, profile, profileIdxs, 0, reduced_result, reduced_loc);
     D.clear();
     D.shrink_to_fit();
 #else
@@ -1025,8 +1151,11 @@ void* doThreadSTOMP(void* argsp){
 	    }
 		
 	}*/
-	thrust::device_vector<unsigned int> counts(n, 0);
+	thrust::device_vector<unsigned int> counts(ceil(n / WORK_SIZE), 0);
+	thrust::device_vector<unsigned int> localLocks(ceil(numWorkers / (double)WORK_SIZE)* WORK_SIZE*3,0);
+	//thrust::device_vector<mp_entry> MPUpdate(n,0);
 	WavefrontUpdateSelfJoin<<<dim3(ceil(numWorkers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1)>>>(QTtrunc.data().get(), Ta -> data().get(), Tb -> data().get(), Means.data().get(), stds.data().get(), profile -> data().get(), profileIdxs -> data().get(), m, n, start, end, counts.data().get(), NUM_THREADS);
+	gpuErrchk( cudaPeekAtLastError() );	
 	cudaDeviceSynchronize();
 	//std::cout << thrust::reduce(counts.begin(), counts.end(), 0, thrust::plus<unsigned long long>()) << std::endl;	
 	time_t now3;
@@ -1038,12 +1167,12 @@ void* doThreadSTOMP(void* argsp){
 
 //Allocates threads on a CPU to distribute work to each specified device
 __host__ void STOMP(thrust::host_vector<DATA_TYPE>& Ta, unsigned int m,
-		    thrust::host_vector<DATA_TYPE>& profile_h, thrust::host_vector<unsigned int>& profileIdxs_h){
+		    thrust::host_vector<float>& profile_h, thrust::host_vector<unsigned int>& profileIdxs_h){
 	
 	gpuErrchk(cudaGetDeviceCount(&nDevices));
 	STOMPinit(Ta.size());
 	thrust::device_vector<DATA_TYPE>* Ta_d = new thrust::device_vector<DATA_TYPE>[nDevices];
-	thrust::device_vector<DATA_TYPE>* Profs[NUM_THREADS];
+	thrust::device_vector<unsigned long long int>* Profs[NUM_THREADS];
 	thrust::device_vector<unsigned int>* ProfsIdxs[NUM_THREADS];
 	//printf("HERE\n");
 	for(int i = 0; i < nDevices; ++i){
@@ -1053,7 +1182,7 @@ __host__ void STOMP(thrust::host_vector<DATA_TYPE>& Ta, unsigned int m,
 	//printf("HERE2\n");
 	for(int i = 0; i < NUM_THREADS; ++i){
 	    gpuErrchk(cudaSetDevice(i % nDevices));
-	    Profs[i] = new thrust::device_vector<DATA_TYPE>();
+	    Profs[i] = new thrust::device_vector<unsigned long long int>();
 	    ProfsIdxs[i] = new thrust::device_vector<unsigned int>();
 	}
 	printf("HERE3\n");
@@ -1091,7 +1220,7 @@ __host__ void STOMP(thrust::host_vector<DATA_TYPE>& Ta, unsigned int m,
 		pthread_join(threads[x], NULL);
 	
 	gpuErrchk(cudaSetDevice(0));
-    thrust::device_vector<DATA_TYPE> profile(Ta.size() - m + 1, _MAX_VAL_);
+    thrust::device_vector<float> profile(Ta.size() - m + 1, FLT_MAX);
     thrust::device_vector<unsigned int> profileIdxs(Ta.size() - m + 1, 0);
     // = profile.resize(Ta.size() - m + 1, _MAX_VAL_);
 	//profileIdxs.resize(Ta.size() - m + 1, 0);
@@ -1099,14 +1228,14 @@ __host__ void STOMP(thrust::host_vector<DATA_TYPE>& Ta, unsigned int m,
 	for(int i = 0; i < NUM_THREADS; ++i){
 	    if(i % nDevices != 0){
 	        gpuErrchk(cudaSetDevice(i % nDevices));
-	        thrust::host_vector<DATA_TYPE> temp = *Profs[i];
-	        thrust::host_vector<DATA_TYPE> temp2 = *ProfsIdxs[i];
+	        thrust::host_vector<unsigned long long int> temp = *Profs[i];
+	        //thrust::host_vector<unsigned long long int> temp2 = *ProfsIdxs[i];
 	        delete Profs[i];
 	        delete ProfsIdxs[i];
 	        gpuErrchk(cudaSetDevice(0));
-	        Profs[i] = new thrust::device_vector<DATA_TYPE>(temp);
+	        Profs[i] = new thrust::device_vector<unsigned long long int>(temp);
 	        gpuErrchk( cudaPeekAtLastError() );
-	        ProfsIdxs[i] = new thrust::device_vector<unsigned int>(temp2); 
+	        ProfsIdxs[i] = new thrust::device_vector<unsigned int>(); 
 	        gpuErrchk( cudaPeekAtLastError() );
 	    }
 	    
@@ -1115,10 +1244,10 @@ __host__ void STOMP(thrust::host_vector<DATA_TYPE>& Ta, unsigned int m,
 	//Compute final distance profile (Aggragate what each thread produced)
 	for(int i = 0; i < NUM_THREADS; ++i){
 		int curstart=0;
-		thrust::for_each(thrust::make_zip_iterator(thrust::make_tuple(profile.begin() + curstart, Profs[i] -> begin() + curstart, profileIdxs.begin() + curstart, ProfsIdxs[i]->begin() + curstart)), thrust::make_zip_iterator(thrust::make_tuple(profile.end(), Profs[i] -> end(), profileIdxs.end(), ProfsIdxs[i] -> end())), minWithIndex2());
+		thrust::for_each(thrust::make_zip_iterator(thrust::make_tuple(profile.begin(), profileIdxs.begin(), Profs[i] -> begin())), thrust::make_zip_iterator(thrust::make_tuple(profile.end(), profileIdxs.end(), Profs[i] -> end())), minWithIndex2());
 		gpuErrchk( cudaPeekAtLastError() );
 	}
-	thrust::transform(profile.begin(), profile.end(), profile.begin(), squareroot());
+	//thrust::transform(profile.begin(), profile.end(), profile.begin(), squareroot());
     for(int i = 0; i < NUM_THREADS; ++i){
         printf("HELLO\n");
         delete Profs[i];
@@ -1144,7 +1273,7 @@ int main(int argc, char** argv) {
 	//thrust::device_vector<DATA_TYPE> T;
 	//T = Th;
 	int size = Th.size();
-	thrust::host_vector<DATA_TYPE> profile;
+	thrust::host_vector<float> profile;
 	thrust::host_vector<unsigned int> profIdxs;
 	printf("Starting STOMP\n");
 	time_t now;
@@ -1174,5 +1303,6 @@ int main(int argc, char** argv) {
     printf("Done\n");
 	return 0;
 }
+
 
 
