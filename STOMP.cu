@@ -242,7 +242,7 @@ __global__ void CalculateDistProfile(DATA_TYPE* QT, DATA_TYPE* D, DATA_TYPE* Mea
 	int a = blockIdx.x * blockDim.x + threadIdx.x;
 	if(a < n && a > start - exclusionZone && a < start + exclusionZone ){
 	//if(a == start){
-		D[a] = _MAX_VAL_;
+		D[a] = FLT_MAX;
 	}else if( a < n){
 	    //D[a] = sqrt(abs(2 * (m - (QT[a] - m * Means[a] * Qmean) / (stds[a] * Qstd))));
 		D[a] = sqrt(abs(2 * (m - (QT[a] - m * Means[a] * Qmean) / (stds[a] * Qstd))));
@@ -760,75 +760,37 @@ void reducemain(thrust::device_vector<DATA_TYPE>& vd, unsigned int start_loc, un
 
 __device__ inline unsigned long long int MPatomicMin(volatile unsigned long long int* address, double val, unsigned int idx)
 {
-    float fval = (float)val;
-    mp_entry loc, loctest;
-    loc.floats[0] = (float) val;
-    loc.ints[1] = idx;
-    loctest.ulong = *address;
-    while (loctest.floats[0] > fval) 
-      loctest.ulong = atomicCAS((unsigned long long int*) address, loctest.ulong,  loc.ulong);
+	float fval = (float)val;
+	mp_entry loc, loctest;
+	loc.floats[0] = fval;
+	loc.ints[1] = idx;
+	loctest.ulong = *address;
+	while (loctest.floats[0] > fval){
+		loctest.ulong = atomicCAS((unsigned long long int*) address, loctest.ulong,  loc.ulong);
+	}
 	return loctest.ulong;
-	
-    //volatile unsigned long long int* address_as_ull = (volatile unsigned long long int*) address;
-    //volatile unsigned long long int old = *address_as_ull, assumed;
-    //do {
-    //    assumed = old;
-    //    old = atomicCAS((unsigned long long int*)address_as_ull, (unsigned long long int)assumed,
-    //        __double_as_longlong(fmin(val, __longlong_as_double(assumed))));
-    //} while (assumed != old);
-    //return __longlong_as_double(old);
-}
-
-
-__device__ void acquireLockUpdateMP(volatile DATA_TYPE* profile, unsigned int* profileIdxs, unsigned int* locks, double dist, int toCheck, int other){
-	bool isSet = false; 
-	do 
-	{
-		if(isSet = atomicCAS(&locks[toCheck], 0, 1) == 0) 
-		{
-			if(profile[toCheck] > dist)
-			{
-				profile[toCheck] = dist;
-				profileIdxs[toCheck] = other;
-			}
-		}
-		if (isSet) 
-		{
-			//locks[toCheck] = 0;
-			atomicExch(&locks[toCheck],0);
-		}
-	}while(!isSet);
 }
 
 
 
-__device__ inline void acquireLockUpdateMPGlobal(volatile unsigned long long* profile, unsigned int* profileIdxs, unsigned int* locks, volatile mp_entry* localMP, const int chunk, const int offset, const int n){
+
+__device__ inline void UpdateMPGlobal(volatile unsigned long long* profile, unsigned int* locks, volatile mp_entry* localMP, const int chunk, const int offset, const int n){
 	
-	__syncthreads();
-	if(threadIdx.x == 0){
-		while (atomicCAS(&locks[chunk], 0, 1) != 0);
-	}
-	__syncthreads();
 	int x = chunk*blockDim.x+threadIdx.x;
-	if(x < n && ((mp_entry*) profile)[x].floats[0] > localMP[threadIdx.x+offset].floats[0]){
-		profile[x] = localMP[threadIdx.x+offset].ulong;
-		//profileIdxs[x] = localIdxs[threadIdx.x+offset];
+	if(x < n && ((mp_entry*) profile)[x].floats[0] > localMP[threadIdx.x+offset].floats[0])
+	{
+			MPatomicMin(&profile[x], localMP[threadIdx.x+offset].floats[0], localMP[threadIdx.x+offset].ints[1]);
 	}
-	__syncthreads();
-	if(threadIdx.x == 0){
-		atomicExch(&locks[chunk], 0);
-	}
-	//__syncthreads();
 }
 
 __global__ void WavefrontUpdateSelfJoin(DATA_TYPE* QT, DATA_TYPE* Ta, DATA_TYPE* Tb, DATA_TYPE* means, DATA_TYPE* stds, volatile unsigned long long int* profile, unsigned int *profileIdxs, unsigned int m, unsigned int n, int startPos, int endPos, unsigned int *counts, int numDevices){
 	__shared__ volatile mp_entry localMPMain[WORK_SIZE * 2];
 	__shared__ volatile mp_entry localMPOther[WORK_SIZE];
-	//__shared__ volatile bool updated[3];
+	__shared__ volatile bool updated[3];
 
 
 	int a = ((blockIdx.x * numDevices) + startPos) * blockDim.x + threadIdx.x;
-	const int b = ((blockIdx.x * numDevices) + startPos + 1) * blockDim.x;
+	//const int b = ((blockIdx.x * numDevices) + startPos + 1) * blockDim.x;
 	int exclusion = m / 4;
 	double workspace;
 	int localX = threadIdx.x + 1;
@@ -837,28 +799,35 @@ __global__ void WavefrontUpdateSelfJoin(DATA_TYPE* QT, DATA_TYPE* Ta, DATA_TYPE*
 	int chunkIdxOther = 0;
 	int mainStart = blockDim.x * chunkIdxMain;
 	int otherStart = 0;
-	if((numDevices > 1 && a < b && a < n) || (numDevices == 1 && a < n))
-	{
+	if(a < n){
 		workspace = QT[a];
-		//Initialize Shared Data
-		if(mainStart+threadIdx.x < n){
-			localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
-		}else{
-			localMPMain[threadIdx.x].floats[0] = FLT_MAX;
-			localMPMain[threadIdx.x].ints[1] = 0;
-		}
-		if(mainStart+threadIdx.x+blockDim.x < n){
-			localMPMain[blockDim.x + threadIdx.x].ulong = profile[mainStart + blockDim.x + threadIdx.x];
-		}else{
-			localMPMain[blockDim.x + threadIdx.x].floats[0] = FLT_MAX;
-			localMPMain[blockDim.x + threadIdx.x].ints[1] = 0;
-		}
-		if(otherStart+threadIdx.x < n){
-			localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
-		}else{
-			localMPOther[threadIdx.x].floats[0] = FLT_MAX;
-			localMPOther[threadIdx.x].ints[1] = 0;
-		}
+	}else{
+		workspace = -1;
+	}
+	//Initialize Shared Data
+	if(mainStart+threadIdx.x < n){
+		localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
+	}else{
+		localMPMain[threadIdx.x].floats[0] = FLT_MAX;
+		localMPMain[threadIdx.x].ints[1] = 0;
+	}
+	if(mainStart+threadIdx.x+blockDim.x < n){
+		localMPMain[blockDim.x + threadIdx.x].ulong = profile[mainStart + blockDim.x + threadIdx.x];
+	}else{
+		localMPMain[blockDim.x + threadIdx.x].floats[0] = FLT_MAX;
+		localMPMain[blockDim.x + threadIdx.x].ints[1] = 0;
+	}
+	if(otherStart+threadIdx.x < n){
+		localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
+	}else{
+		localMPOther[threadIdx.x].floats[0] = FLT_MAX;
+		localMPOther[threadIdx.x].ints[1] = 0;
+	}
+	if(threadIdx.x == 0)
+	{
+		updated[0] = false;
+		updated[1] = false;
+		updated[2] = false;
 	}
 	int x = a + 1;
 	int y = 1;
@@ -870,19 +839,28 @@ __global__ void WavefrontUpdateSelfJoin(DATA_TYPE* QT, DATA_TYPE* Ta, DATA_TYPE*
 			workspace = workspace - Ta[x - 1] * Tb[y - 1] + Ta[x + m - 1] * Tb[ y + m - 1];
 			if(!(x > y - exclusion && x < y + exclusion))
 			{
+				//Compute the next distance value
 				double dist = sqrt(abs(2 * (m - (workspace - m * means[x] * means[y]) / (stds[x] * stds[y]))));
-				
+
+				//Check cache to see if we even need to try to update
 				if(localMPMain[localX].floats[0] > dist)
-				{					
-					//acquireLockUpdateMP(localMPMain, localIdxsMain, localLocksMain, dist, localX, y);	
-					MPatomicMin(&profile[x], dist, y);
+				{	
+					//Update the cache with the new min value atomically
 					MPatomicMin((unsigned long long int*)&localMPMain[localX], dist, y);
+					if(localX < blockDim.x && !updated[0]){
+						updated[0] = true;
+					}else if(!updated[1]){
+						updated[1] = true;
+					}
 				}
+				//Check cache to see if we even need to try to update
 				if(localMPOther[localY].floats[0] > dist)
 				{
-					//acquireLockUpdateMP(localMPOther, localIdxsOther, localLocksOther, dist, localY, x);
-					MPatomicMin(&profile[y], dist, x);
+					//Update the cache with the new min value atomically
 					MPatomicMin((unsigned long long int*)&localMPOther[localY], dist, x);
+					if(!updated[2]){
+						updated[2] = true;
+					}				
 				}
 			}			
 			++x;
@@ -891,40 +869,50 @@ __global__ void WavefrontUpdateSelfJoin(DATA_TYPE* QT, DATA_TYPE* Ta, DATA_TYPE*
 			++localY;
 		}
 		__syncthreads();
-		//acquireLockUpdateMPGlobal(profile, profileIdxs, counts, localMPMain, chunkIdxMain, 0,n);
-		//acquireLockUpdateMPGlobal(profile, profileIdxs, counts, localMPMain, chunkIdxMain + 1, blockDim.x,n);
-		//acquireLockUpdateMPGlobal(profile, profileIdxs, counts, localMPOther, chunkIdxOther, 0,n);		
+		if(updated[0]){
+			UpdateMPGlobal(profile, counts, localMPMain, chunkIdxMain, 0,n);
+		}
+		if(updated[1]){
+			UpdateMPGlobal(profile, counts, localMPMain, chunkIdxMain + 1, blockDim.x,n);
+		}
+		if(updated[2]){
+			UpdateMPGlobal(profile, counts, localMPOther, chunkIdxOther, 0,n);	
+		}
+		__syncthreads();	
+		if(threadIdx.x == 0){
+			updated[0] = false;
+			updated[1] = false;
+			updated[2] = false;
+		}		
 		mainStart += blockDim.x;
 		otherStart += blockDim.x;
-		if((numDevices > 1 && a < b && a < n) || (numDevices == 1 && a < n))
+		//Update local cache to point to the next chunk of the MP
+		if(mainStart+threadIdx.x < n)
 		{
-			if(mainStart+threadIdx.x < n)
-			{
-				localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
-			}
-			else
-			{
-				localMPMain[threadIdx.x].floats[0] = FLT_MAX;
-				localMPMain[threadIdx.x].ints[1] = 0;
-			}
-			if(mainStart+threadIdx.x+blockDim.x < n)
-			{
-				localMPMain[blockDim.x + threadIdx.x].ulong = profile[mainStart + blockDim.x + threadIdx.x];
-			}
-			else
-			{
-				localMPMain[threadIdx.x + blockDim.x].floats[0] = FLT_MAX;
-				localMPMain[threadIdx.x + blockDim.x].ints[1] = 0;
-			}
-			if(otherStart+threadIdx.x < n)
-			{
-				localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
-			}
-			else
-			{
-				localMPOther[threadIdx.x].floats[0] = FLT_MAX;
-				localMPOther[threadIdx.x].ints[1] = 0;
-			}	
+			localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
+		}
+		else
+		{
+			localMPMain[threadIdx.x].floats[0] = FLT_MAX;
+			localMPMain[threadIdx.x].ints[1] = 0;
+		}
+		if(mainStart+threadIdx.x+blockDim.x < n)
+		{
+			localMPMain[blockDim.x + threadIdx.x].ulong = profile[mainStart + blockDim.x + threadIdx.x];
+		}
+		else
+		{
+			localMPMain[threadIdx.x + blockDim.x].floats[0] = FLT_MAX;
+			localMPMain[threadIdx.x + blockDim.x].ints[1] = 0;
+		}
+		if(otherStart+threadIdx.x < n)
+		{
+			localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
+		}
+		else
+		{
+			localMPOther[threadIdx.x].floats[0] = FLT_MAX;
+			localMPOther[threadIdx.x].ints[1] = 0;
 		}	
 		localY = 0;
 		localX = threadIdx.x;
@@ -932,7 +920,10 @@ __global__ void WavefrontUpdateSelfJoin(DATA_TYPE* QT, DATA_TYPE* Ta, DATA_TYPE*
 		chunkIdxOther++;	
 	}
 	//__syncthreads();
-	//acquireLockUpdateMPGlobal(profile, profileIdxs, counts, localMPOther, chunkIdxOther, localIdxsOther, 0, n);
+	//acquireLockUpdateMPGlobal(profile, counts, localMPMain, chunkIdxMain, 0,n);
+	//acquireLockUpdateMPGlobal(profile, counts, localMPMain, chunkIdxMain + 1, blockDim.x,n);
+	//acquireLockUpdateMPGlobal(profile, counts, localMPOther, chunkIdxOther, 0,n);	
+	//acquireLockUpdateMPGlobal(profile, counts, localMPOther, chunkIdxOther, localIdxsOther, 0, n);
 	//acquireLockUpdateMPGlobal(profile, profileIdxs, counts, localMPMain, chunkIdxMain, localIdxsMain, 0, n);
 	//acquireLockUpdateMPGlobal(profile, profileIdxs, counts, localMPMain, chunkIdxMain+1, localIdxsMain, blockDim.x, n);
 }
@@ -1045,7 +1036,14 @@ void* doThreadSTOMP(void* argsp){
 	//cout << pos << " " << val; 
 	(*profileIdxs)[0] = pos;
 	D[0] = *it;
+	
 	thrust::transform(D.begin(), D.end(), profileIdxs->begin(), profile->begin(), MPIDXCombine());
+	//thrust::host_vector<unsigned long long> Dt = *profile;	
+	//for(int i = 0; i < D.size(); ++i){
+	//	mp_entry x;
+	//	x.ulong = Dt[i];
+	//	std::cout << x.floats[0] << std::endl;
+	//} 
 	//ComputeMPIDXProfile<<<grid, block>>>(profile,)
 	//if (n>1)
 	//	reducemain(D, 1, 2048, 1024, n-1, profile, profileIdxs, 0, reduced_result, reduced_loc);
@@ -1152,7 +1150,7 @@ void* doThreadSTOMP(void* argsp){
 		
 	}*/
 	thrust::device_vector<unsigned int> counts(ceil(n / WORK_SIZE), 0);
-	thrust::device_vector<unsigned int> localLocks(ceil(numWorkers / (double)WORK_SIZE)* WORK_SIZE*3,0);
+	//thrust::device_vector<unsigned int> localLocks(ceil(numWorkers / (double)WORK_SIZE)* WORK_SIZE*3,0);
 	//thrust::device_vector<mp_entry> MPUpdate(n,0);
 	WavefrontUpdateSelfJoin<<<dim3(ceil(numWorkers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1)>>>(QTtrunc.data().get(), Ta -> data().get(), Tb -> data().get(), Means.data().get(), stds.data().get(), profile -> data().get(), profileIdxs -> data().get(), m, n, start, end, counts.data().get(), NUM_THREADS);
 	gpuErrchk( cudaPeekAtLastError() );	
