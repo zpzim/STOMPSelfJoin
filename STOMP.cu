@@ -135,7 +135,7 @@ __global__ void CalculateDistProfile(DATA_TYPE* QT, DATA_TYPE* D, DATA_TYPE* Mea
 }
 
 //This kernel divides each element in A by divisor
-__global__ void divideBy(DATA_TYPE* A, DATA_TYPE divisor, unsigned int size){
+__global__ void divideBy(double* A, double divisor, unsigned int size){
 	int a = blockIdx.x * blockDim.x + threadIdx.x;
 	if(a < size){
 		A[a] /= divisor;
@@ -219,12 +219,156 @@ __device__ inline unsigned long long int MPatomicMin(volatile unsigned long long
 }
 
 //Updates the global matrix profile based on a block-local, cached version
-__device__ inline void UpdateMPGlobal(volatile unsigned long long* profile, volatile mp_entry* localMP, const int chunk, const int offset, const int n){
+__device__ inline void UpdateMPGlobal(volatile unsigned long long* profile, volatile mp_entry* localMP, const int chunk, const int offset, const int n, const int factor){
 	
-	int x = chunk*blockDim.x+threadIdx.x;
+	int x = chunk*(blockDim.x/factor)+threadIdx.x;
 	if(x < n && ((mp_entry*) profile)[x].floats[0] > localMP[threadIdx.x+offset].floats[0])
 	{
 			MPatomicMin(&profile[x], localMP[threadIdx.x+offset].floats[0], localMP[threadIdx.x+offset].ints[1]);
+	}
+}
+
+
+//This version computes the matrix profile under the assumption that the input time series is actually a concatenation of some number of other time series with length (instanceLength)
+//Ignores overlapping regions between independant time series when concatenated 
+__global__ void WavefrontUpdateSelfJoinWithExclusion(const double* QT, const double* Ta, const double* Tb, const double* means, const double* stds, unsigned long long int* profile, unsigned int m, unsigned int n, int startPos, int endPos, int numDevices, int instanceLength){
+	__shared__ volatile mp_entry localMPMain[WORK_SIZE * 2];
+	__shared__ volatile mp_entry localMPOther[WORK_SIZE];
+	__shared__ volatile bool updated[3];
+
+
+	int a = ((blockIdx.x * numDevices) + startPos) * blockDim.x + threadIdx.x;
+	//const int b = ((blockIdx.x * numDevices) + startPos + 1) * blockDim.x;
+	int exclusion = m / 4;
+	double workspace;
+	int localX = threadIdx.x + 1;
+	int localY = 1;
+	int chunkIdxMain = a / blockDim.x;
+	int chunkIdxOther = 0;
+	int mainStart = blockDim.x * chunkIdxMain;
+	int otherStart = 0;
+	if(a < n){
+		workspace = QT[a];
+	}else{
+		workspace = -1;
+	}
+	//Initialize Shared Data
+	if(mainStart+threadIdx.x < n){
+		localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
+	}else{
+		localMPMain[threadIdx.x].floats[0] = FLT_MAX;
+		localMPMain[threadIdx.x].ints[1] = 0;
+	}
+	if(mainStart+threadIdx.x+blockDim.x < n){
+		localMPMain[blockDim.x + threadIdx.x].ulong = profile[mainStart + blockDim.x + threadIdx.x];
+	}else{
+		localMPMain[blockDim.x + threadIdx.x].floats[0] = FLT_MAX;
+		localMPMain[blockDim.x + threadIdx.x].ints[1] = 0;
+	}
+	if(otherStart+threadIdx.x < n){
+		localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
+	}else{
+		localMPOther[threadIdx.x].floats[0] = FLT_MAX;
+		localMPOther[threadIdx.x].ints[1] = 0;
+	}
+	if(threadIdx.x == 0)
+	{
+		updated[0] = false;
+		updated[1] = false;
+		updated[2] = false;
+	}
+	int x = a + 1;
+	int y = 1;
+	
+	while(mainStart < n && otherStart < n)
+	{
+		__syncthreads();
+		//Update to the end of the current chunk
+		while(x < n && y < n && localY < blockDim.x)
+		{
+			workspace = workspace - Ta[x - 1] * Tb[y - 1] + Ta[x + m - 1] * Tb[ y + m - 1];
+			if(x / instanceLength != y / instanceLength && x % instanceLength + m  <= instanceLength && y % instanceLength + m <= instanceLength )
+			{
+				//Compute the next distance value
+				double dist = sqrt(abs(2 * (m - (workspace - m * means[x] * means[y]) / (stds[x] * stds[y]))));
+
+				//Check cache to see if we even need to try to update
+				if(localMPMain[localX].floats[0] > dist)
+				{	
+					//Update the cache with the new min value atomically
+					MPatomicMin((unsigned long long int*)&localMPMain[localX], dist, y);
+					if(localX < blockDim.x && !updated[0]){
+						updated[0] = true;
+					}else if(!updated[1]){
+						updated[1] = true;
+					}
+				}
+				//Check cache to see if we even need to try to update
+				if(localMPOther[localY].floats[0] > dist)
+				{
+					//Update the cache with the new min value atomically
+					MPatomicMin((unsigned long long int*)&localMPOther[localY], dist, x);
+					if(!updated[2]){
+						updated[2] = true;
+					}				
+				}
+			}			
+			++x;
+			++y;
+			++localX;
+			++localY;
+		}
+		__syncthreads();
+		//If we updated any values in the cached MP, try to push them to the global "master" MP
+		if(updated[0]){
+			UpdateMPGlobal(profile, localMPMain, chunkIdxMain, 0,n,1);
+		}
+		if(updated[1]){
+			UpdateMPGlobal(profile, localMPMain, chunkIdxMain + 1, blockDim.x,n,1);
+		}
+		if(updated[2]){
+			UpdateMPGlobal(profile, localMPOther, chunkIdxOther, 0,n,1);	
+		}
+		__syncthreads();	
+		if(threadIdx.x == 0){
+			updated[0] = false;
+			updated[1] = false;
+			updated[2] = false;
+		}		
+		mainStart += blockDim.x;
+		otherStart += blockDim.x;
+		//Update local cache to point to the next chunk of the MP
+		if(mainStart+threadIdx.x < n)
+		{
+			localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
+		}
+		else
+		{
+			localMPMain[threadIdx.x].floats[0] = FLT_MAX;
+			localMPMain[threadIdx.x].ints[1] = 0;
+		}
+		if(mainStart+threadIdx.x+blockDim.x < n)
+		{
+			localMPMain[blockDim.x + threadIdx.x].ulong = profile[mainStart + blockDim.x + threadIdx.x];
+		}
+		else
+		{
+			localMPMain[threadIdx.x + blockDim.x].floats[0] = FLT_MAX;
+			localMPMain[threadIdx.x + blockDim.x].ints[1] = 0;
+		}
+		if(otherStart+threadIdx.x < n)
+		{
+			localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
+		}
+		else
+		{
+			localMPOther[threadIdx.x].floats[0] = FLT_MAX;
+			localMPOther[threadIdx.x].ints[1] = 0;
+		}	
+		localY = 0;
+		localX = threadIdx.x;
+		chunkIdxMain++;
+		chunkIdxOther++;	
 	}
 }
 
@@ -319,13 +463,13 @@ __global__ void WavefrontUpdateSelfJoin(double* QT, double* Ta, double* Tb, doub
 		__syncthreads();
 		//If we updated any values in the cached MP, try to push them to the global "master" MP
 		if(updated[0]){
-			UpdateMPGlobal(profile, localMPMain, chunkIdxMain, 0,n);
+			UpdateMPGlobal(profile, localMPMain, chunkIdxMain, 0,n, 1);
 		}
 		if(updated[1]){
-			UpdateMPGlobal(profile, localMPMain, chunkIdxMain + 1, blockDim.x,n);
+			UpdateMPGlobal(profile, localMPMain, chunkIdxMain + 1, blockDim.x,n, 1);
 		}
 		if(updated[2]){
-			UpdateMPGlobal(profile, localMPOther, chunkIdxOther, 0,n);	
+			UpdateMPGlobal(profile, localMPOther, chunkIdxOther, 0,n, 1);	
 		}
 		__syncthreads();	
 		if(threadIdx.x == 0){
@@ -365,6 +509,236 @@ __global__ void WavefrontUpdateSelfJoin(double* QT, double* Ta, double* Tb, doub
 		}	
 		localY = 0;
 		localX = threadIdx.x;
+		chunkIdxMain++;
+		chunkIdxOther++;	
+	}
+}
+
+//Computes the matrix profile given the sliding dot products for the first query and the precomputed data statisics
+//This version requires at LEAST 92KB shared memory per SM for maximum occupancy (currently this requirement is satisfied by compute capabilites 3.7, 5.2, and 6.1
+//If your GPU does not meet this requirement, try this algorithm and WafefrontUpdateSelfJoin and pick the one that gives better peformance for your GPU
+//The best performance for this version is achieved when using a block size of 1024 and the lowest power-of-two factor possible for the shared memory available on your GPU, for the Tesla K80 this value is 16.
+//Minimum shared memory usage is 5*sizeof(double)*WORK_SIZE + X. X varies with the value of factor. X = 10*sizeof(double)*WORK_SIZE / factor
+__global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const double* Ta, const double* Tb, const double* means, const double* stds, unsigned long long int* profile, unsigned int m, unsigned int n, int startPos, int endPos, int numDevices){
+	//Factor and threads per block must both be powers of two where: factor <= threads per block
+	//Use the smallest power of 2 possible for your GPU
+	const int factor = 16;
+	__shared__ volatile mp_entry localMPMain[WORK_SIZE + WORK_SIZE / factor];
+	__shared__ volatile mp_entry localMPOther[WORK_SIZE / factor];
+	__shared__ double A_low[WORK_SIZE + WORK_SIZE / factor];
+	__shared__ double A_high[WORK_SIZE + WORK_SIZE / factor];
+	__shared__ double mu_x[WORK_SIZE + WORK_SIZE / factor];
+	__shared__ double mu_y[WORK_SIZE / factor];
+	__shared__ double sigma_x[WORK_SIZE + WORK_SIZE / factor];
+	__shared__ double sigma_y[WORK_SIZE / factor];
+	__shared__ double B_high[WORK_SIZE / factor];
+	__shared__ double B_low[WORK_SIZE / factor];
+	__shared__ volatile bool updated[3];
+
+
+	int a = ((blockIdx.x * numDevices) + startPos) * blockDim.x + threadIdx.x;
+	//const int b = ((blockIdx.x * numDevices) + startPos + 1) * blockDim.x;
+	int exclusion = m / 4;
+	double workspace;
+	int localX = threadIdx.x + 1;
+	int localY = 1;
+	int chunkIdxMain = (a / blockDim.x) *factor;
+	int chunkIdxOther = 0;
+	int mainStart = (blockDim.x / factor) * chunkIdxMain;
+	int otherStart = 0;
+	if(a < n){
+		workspace = QT[a];
+	}else{
+		workspace = -1;
+	}
+	//Initialize Shared Data
+	if(mainStart+threadIdx.x < n){
+		localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
+	}else{
+		localMPMain[threadIdx.x].floats[0] = FLT_MAX;
+		localMPMain[threadIdx.x].ints[1] = 0;
+	}
+	if(threadIdx.x < blockDim.x / factor && mainStart+threadIdx.x+blockDim.x < n){
+		localMPMain[blockDim.x + threadIdx.x].ulong = profile[mainStart + blockDim.x + threadIdx.x];
+	}else if( threadIdx.x < blockDim.x / factor){
+		localMPMain[blockDim.x + threadIdx.x].floats[0] = FLT_MAX;
+		localMPMain[blockDim.x + threadIdx.x].ints[1] = 0;
+	}
+	if(threadIdx.x < blockDim.x / factor && otherStart+threadIdx.x < n){
+		localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
+	}else if(threadIdx.x < blockDim.x / factor){
+		localMPOther[threadIdx.x].floats[0] = FLT_MAX;
+		localMPOther[threadIdx.x].ints[1] = 0;
+	}
+	if(threadIdx.x == 0)
+	{
+		updated[0] = false;
+		updated[1] = false;
+		updated[2] = false;
+	}
+	int x = a + 1;
+	int y = 1;
+	if(x - 1 < n){
+		A_low[threadIdx.x] = Ta[x - 1];
+	}
+	if(x + m - 1 < n + m - 1){
+		A_high[threadIdx.x] = Ta[x + m - 1];
+	}
+	if(threadIdx.x < blockDim.x / factor && x + blockDim.x - 1 < n + m  - 1){
+		A_low[threadIdx.x + blockDim.x] = Ta[x + blockDim.x - 1];
+	}
+	
+	if(threadIdx.x < blockDim.x / factor && x + blockDim.x - 1 + m < n + m  - 1){
+		A_high[threadIdx.x + blockDim.x] = Ta[x + blockDim.x - 1 + m];
+	}
+	if(a < n){
+		sigma_x[threadIdx.x] = stds[a];
+		mu_x[threadIdx.x] = means[a];
+	}
+	if(threadIdx.x < blockDim.x / factor && a + blockDim.x < n){
+		sigma_x[threadIdx.x + blockDim.x] = stds[a + blockDim.x];
+		mu_x[threadIdx.x + blockDim.x] = means[a + blockDim.x];
+	}
+	if(threadIdx.x < blockDim.x / factor){
+		
+		B_low[threadIdx.x] = Tb[threadIdx.x];
+		B_high[threadIdx.x] = Tb[threadIdx.x + m];
+		sigma_y[threadIdx.x] = stds[threadIdx.x];
+		mu_y[threadIdx.x] = means[threadIdx.x];
+	}
+	
+	int relativeX = threadIdx.x;
+	int relativeY = 0;
+	while(mainStart < n && otherStart < n)
+	{
+		__syncthreads();
+		//Update to the end of the current chunk
+		while(x < n && y < n && localY < blockDim.x / factor)
+		{
+			//workspace = workspace - Ta[x - 1] * Tb[y - 1] + Ta[x + m - 1] * Tb[ y + m - 1];
+			workspace = workspace - A_low[relativeX]* B_low[relativeY] + A_high[relativeX]  * B_high[relativeY];
+			//workspace = workspace - Ta[x - 1] * B_low[relativeY] + Ta[x + m - 1] * B_high[relativeY];
+			//workspace = workspace - A_low[relativeX] * B_low[relativeY] + Ta[x + m - 1] * B_high[relativeY];
+			//workspace = workspace - Ta[x - 1] * B_low[relativeY] + A_high[relativeX] * B_high[relativeY];
+			if(!(x > y - exclusion && x < y + exclusion))
+			{
+				//Compute the next distance value
+				//double dist = sqrt(abs(2 * (m - (workspace - m * means[x] * means[y]) / (stds[x] * stds[y]))));
+				double dist = sqrt(abs(2 * (m - (workspace - m * mu_x[localX] * mu_y[localY]) / (sigma_x[localX] * sigma_y[localY]))));
+				//Check cache to see if we even need to try to update
+				if(localMPMain[localX].floats[0] > dist)
+				{	
+					//Update the cache with the new min value atomically
+					MPatomicMin((unsigned long long int*)&localMPMain[localX], dist, y);
+					if(localX < blockDim.x && !updated[0]){
+						updated[0] = true;
+					}else if(!updated[1]){
+						updated[1] = true;
+					}
+				}
+				//Check cache to see if we even need to try to update
+				if(localMPOther[localY].floats[0] > dist)
+				{
+					//Update the cache with the new min value atomically
+					MPatomicMin((unsigned long long int*)&localMPOther[localY], dist, x);
+					if(!updated[2]){
+						updated[2] = true;
+					}				
+				}
+			}			
+			++x;
+			++y;
+			++localX;
+			++localY;
+			++relativeX;
+			++relativeY;
+		}
+		__syncthreads();
+		//If we updated any values in the cached MP, try to push them to the global "master" MP
+		if(updated[0]){
+			UpdateMPGlobal(profile, localMPMain, chunkIdxMain, 0,n, factor);
+		}
+		if(updated[1]){
+			if(threadIdx.x < blockDim.x / factor){
+				UpdateMPGlobal(profile, localMPMain, chunkIdxMain + factor, blockDim.x, n, factor);
+			}
+		}
+		if(updated[2]){
+			if(threadIdx.x < blockDim.x / factor){
+				UpdateMPGlobal(profile, localMPOther, chunkIdxOther, 0,n, factor);
+			}
+		}
+		__syncthreads();	
+		if(threadIdx.x == 0){
+			updated[0] = false;
+			updated[1] = false;
+			updated[2] = false;
+		}		
+		mainStart += blockDim.x / factor;
+		otherStart += blockDim.x / factor;
+		//Update local cache to point to the next chunk of the MP
+		if(mainStart+threadIdx.x < n)
+		{
+			localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
+		}
+		else
+		{
+			localMPMain[threadIdx.x].floats[0] = FLT_MAX;
+			localMPMain[threadIdx.x].ints[1] = 0;
+		}
+		if(threadIdx.x < blockDim.x / factor && mainStart+threadIdx.x+blockDim.x < n)
+		{
+			localMPMain[blockDim.x + threadIdx.x].ulong = profile[mainStart + blockDim.x + threadIdx.x];
+		}
+		else if( threadIdx.x < blockDim.x / factor)
+		{
+			localMPMain[threadIdx.x + blockDim.x].floats[0] = FLT_MAX;
+			localMPMain[threadIdx.x + blockDim.x].ints[1] = 0;
+		}
+		if(threadIdx.x < blockDim.x / factor && otherStart+threadIdx.x < n)
+		{
+			localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
+		}
+		else if( threadIdx.x < blockDim.x / factor)
+		{
+			localMPOther[threadIdx.x].floats[0] = FLT_MAX;
+			localMPOther[threadIdx.x].ints[1] = 0;
+		}
+		if(x - 1  <  n + m - 1){
+			A_low[threadIdx.x] = Ta[x - 1];
+		}
+		if(threadIdx.x < blockDim.x / factor && x - 1 + blockDim.x < n +m - 1){
+			A_low[threadIdx.x + blockDim.x] = Ta[x + blockDim.x - 1];
+		}
+		
+		if(x + m  - 1 < n + m - 1){
+			A_high[threadIdx.x] = Ta[x + m - 1];
+		}
+		if(threadIdx.x < blockDim.x / factor && x + blockDim.x + m - 1 < n + m - 1){
+			A_high[threadIdx.x + blockDim.x] = Ta[x + blockDim.x + m - 1];
+		}
+		if(threadIdx.x < blockDim.x / factor && y + threadIdx.x - 1 < n + m - 1){
+			B_low[threadIdx.x] = Tb[y + threadIdx.x - 1];
+		}
+		if(threadIdx.x < blockDim.x / factor && y + threadIdx.x - 1 + m < n + m - 1){
+			B_high[threadIdx.x] = Tb[y + threadIdx.x + m - 1];
+		}
+		if(x < n){
+			sigma_x[threadIdx.x] = stds[x];
+			mu_x[threadIdx.x] = means[x];
+		}
+		if(threadIdx.x < blockDim.x / factor && x + blockDim.x < n){
+			sigma_x[threadIdx.x + blockDim.x] = stds[x + blockDim.x];
+			mu_x[threadIdx.x + blockDim.x] = means[x  + blockDim.x];
+		}
+		if(threadIdx.x < blockDim.x / factor && y + threadIdx.x < n){
+			sigma_y[threadIdx.x] = stds[y + threadIdx.x];
+			mu_y[threadIdx.x] = means[y + threadIdx.x];
+		}
+		relativeY = 0;	
+		localY = 0;
+		localX = threadIdx.x;
+		relativeX = threadIdx.x;
 		chunkIdxMain++;
 		chunkIdxOther++;	
 	}
@@ -456,6 +830,8 @@ void* doThreadSTOMP(void* argsp){
 	time(&lastLogged);
 
 	WavefrontUpdateSelfJoin<<<dim3(ceil(numWorkers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1)>>>(QTtrunc.data().get(), Ta -> data().get(), Tb -> data().get(), Means.data().get(), stds.data().get(), profile -> data().get(), m, n, start, end, NUM_THREADS);
+	//To use the most optimized version comment the line above and uncomment the line below (READ THE KERNEL DESCRIPTION FIRST)
+	//WavefrontUpdateSelfJoinMaxSharedMem<<<dim3(ceil(numWorkers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1)>>>(QTtrunc.data().get(), Ta -> data().get(), Tb -> data().get(), Means.data().get(), stds.data().get(), profile -> data().get(), m, n, start, end, NUM_THREADS);
 	gpuErrchk( cudaPeekAtLastError() );	
 	cudaDeviceSynchronize();
 	//std::cout << thrust::reduce(counts.begin(), counts.end(), 0, thrust::plus<unsigned long long>()) << std::endl;	
