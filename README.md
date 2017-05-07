@@ -21,4 +21,6 @@ If you have a GPU with compute cabability 3.7, 5.2, or 6.1 you can build a more 
 * `STOMPbest window_size input_file_path output_matrix_profile_path output_indexes_path`
   
 # Matlab hook
-If you want to use these kernels in Matlab just run `make matlab`. This will output `STOMP.ptx`. Just point Matlab to `STOMP.ptx` and `STOMP.cu` and you should be able to use any of the kernels through the [Matlab parallel computing toolbox](https://www.mathworks.com/products/parallel-computing.html).
+ * If you want to use these kernels in Matlab just run `make matlab`. This will output `STOMP.ptx`.
+ * Just point Matlab to `STOMP.ptx` and `STOMP.cu` and you should be able to use any of the kernels through the [Matlab parallel computing toolbox](https://www.mathworks.com/products/parallel-computing.html).
+ * StompSelfJoinGPU.m is a matlab script which will compute the matrix profile using the GPU. Assuming step 1 was followed.
