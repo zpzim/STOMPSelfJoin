@@ -12,8 +12,15 @@
 #include <thrust/execution_policy.h>
 #include <thrust/extrema.h>
 #include <float.h>
-#include <pthread.h>
+
+
 #include <math.h>
+
+#ifdef _WIN32
+#include<windows.h>
+#else
+#include <pthread.h>
+#endif
 
 #include "cuda_profiler_api.h"
 #include "STOMP.h"
@@ -37,7 +44,11 @@ struct thread_args{
 
 struct thread_args targs[NUM_THREADS];
 int nDevices;
+#ifdef _WIN32
+HANDLE threads[NUM_THREADS];
+#else
 pthread_t threads[NUM_THREADS];
+#endif
 static const unsigned int WORK_SIZE = 1024;
 cufftHandle plan[NUM_THREADS], plan2[NUM_THREADS], plan3[NUM_THREADS], plan4[NUM_THREADS];
 
@@ -94,7 +105,7 @@ void readFile(const char* filename, thrust::host_vector<DATA_TYPE>& v){
 
 //This kernel computes a sliding mean with specified window size and a corresponding prefix sum array (A)
 __global__ void slidingMean(DATA_TYPE* A,  int window, unsigned int size, DATA_TYPE* Means){
-	__const__ DATA_TYPE coeff = 1.0 / (DATA_TYPE)window;
+	const DATA_TYPE coeff = 1.0 / (DATA_TYPE) window;
 	int a = blockIdx.x * blockDim.x + threadIdx.x;
 	int b = blockIdx.x * blockDim.x + threadIdx.x + window;
 
@@ -109,7 +120,7 @@ __global__ void slidingMean(DATA_TYPE* A,  int window, unsigned int size, DATA_T
 
 //This kernel computes a sliding standard deviaiton with specified window size, the corresponding means of each element, and the prefix squared sum at each element
 __global__ void slidingStd(DATA_TYPE* squares, unsigned int window, unsigned int size, DATA_TYPE* Means, DATA_TYPE* stds){
-	__const__ DATA_TYPE coeff = 1 / (DATA_TYPE)window;
+	const DATA_TYPE coeff = 1 / (DATA_TYPE)window;
 	int a = blockIdx.x * blockDim.x + threadIdx.x;
 	int b = blockIdx.x * blockDim.x + threadIdx.x + window;
 	if(a == 0){
@@ -745,8 +756,11 @@ __global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const doub
 }
 
 //Performs STOMP algorithm
-void* doThreadSTOMP(void* argsp){
-    
+#ifdef _WIN32
+DWORD WINAPI doThreadSTOMP(LPVOID argsp){
+#else
+void* doThreadSTOMP(void* argsp) {
+#endif
     	thread_args* args = (thread_args*) argsp;
     	int tid = args->tid;
     	gpuErrchk(cudaSetDevice(tid % nDevices));
@@ -828,17 +842,19 @@ void* doThreadSTOMP(void* argsp){
 	time_t lastLogged;
 	time(&start2);
 	time(&lastLogged);
-
+#ifdef USE_BEST_VER
+	WavefrontUpdateSelfJoinMaxSharedMem<<<dim3(ceil(numWorkers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1)>>>(QTtrunc.data().get(), Ta -> data().get(), Tb -> data().get(), Means.data().get(), stds.data().get(), profile -> data().get(), m, n, start, end, NUM_THREADS);
+#else
 	WavefrontUpdateSelfJoin<<<dim3(ceil(numWorkers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1)>>>(QTtrunc.data().get(), Ta -> data().get(), Tb -> data().get(), Means.data().get(), stds.data().get(), profile -> data().get(), m, n, start, end, NUM_THREADS);
-	//To use the most optimized version comment the line above and uncomment the line below (READ THE KERNEL DESCRIPTION FIRST)
-	//WavefrontUpdateSelfJoinMaxSharedMem<<<dim3(ceil(numWorkers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1)>>>(QTtrunc.data().get(), Ta -> data().get(), Tb -> data().get(), Means.data().get(), stds.data().get(), profile -> data().get(), m, n, start, end, NUM_THREADS);
+#endif
 	gpuErrchk( cudaPeekAtLastError() );	
 	cudaDeviceSynchronize();
 	//std::cout << thrust::reduce(counts.begin(), counts.end(), 0, thrust::plus<unsigned long long>()) << std::endl;	
 	time_t now3;
 	time(&now3);
 	printf("Finished thread %d over all iterations in %lf seconds\n", tid, difftime(now3, start2) + oldTime);
-	pthread_exit(0);
+	//pthread_exit(0);
+	return 0;
 }
 
 
@@ -885,13 +901,22 @@ __host__ void STOMP(thrust::host_vector<DATA_TYPE>& Ta, unsigned int m,
 		targs[tid].exclusion = m / 4;
 		targs[tid].maxJoin = 0;
 		printf("Launching thread %d, for start = %d, to end = %d\n", tid, targs[tid].start, targs[tid].end);
-		int rc = pthread_create(&threads[tid], NULL, doThreadSTOMP, (void*) &targs[tid]);
+#ifdef _WIN32
+		threads[tid] = CreateThread(NULL, 0, doThreadSTOMP, (void*)&targs[tid], 0, NULL);
+#else
+		int rc = pthread_create(&threads[tid], NULL, doThreadSTOMP, (void*)&targs[tid]);
+#endif // _WIN32
+
+		
 		++tid;
 	}
 
 	for(int x = 0; x < NUM_THREADS; x++)
+#ifdef _WIN32
+		WaitForMultipleObjects(NUM_THREADS, threads, TRUE, INFINITE);
+#else
 		pthread_join(threads[x], NULL);
-	
+#endif
 	gpuErrchk(cudaSetDevice(0));
 	thrust::device_vector<float> profile(Ta.size() - m + 1, FLT_MAX);
 	thrust::device_vector<unsigned int> profileIdxs(Ta.size() - m + 1, 0);
