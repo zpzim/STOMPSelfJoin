@@ -90,6 +90,10 @@ void STOMPclean(int size){
 //Reads input time series from file
 void readFile(const char* filename, thrust::host_vector<DATA_TYPE>& v){
 	FILE* f = fopen( filename, "r");
+	if(f == NULL){
+		printf("Unable to open %s for reading, please make sure it exists\n", filename);
+		exit(0);
+	}
 	DATA_TYPE num;
 	while(!feof(f)){
 			fscanf(f, format_str, &num);
@@ -842,7 +846,7 @@ void* doThreadSTOMP(void* argsp) {
 	time_t lastLogged;
 	time(&start2);
 	time(&lastLogged);
-#ifdef USE_BEST_VER
+#ifdef USE_BEST_VERSION
 	WavefrontUpdateSelfJoinMaxSharedMem<<<dim3(ceil(numWorkers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1)>>>(QTtrunc.data().get(), Ta -> data().get(), Tb -> data().get(), Means.data().get(), stds.data().get(), profile -> data().get(), m, n, start, end, NUM_THREADS);
 #else
 	WavefrontUpdateSelfJoin<<<dim3(ceil(numWorkers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1)>>>(QTtrunc.data().get(), Ta -> data().get(), Tb -> data().get(), Means.data().get(), stds.data().get(), profile -> data().get(), m, n, start, end, NUM_THREADS);
