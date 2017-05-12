@@ -841,7 +841,7 @@ void* doThreadSTOMP(void* argsp) {
 	thrust::transform(D.begin(), D.end(), profileIdxs->begin(), profile->begin(), MPIDXCombine());
 	D.clear();
 	D.shrink_to_fit();
-
+	cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
 	time_t start2, now2;
 	time_t lastLogged;
 	time(&start2);
