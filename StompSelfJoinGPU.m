@@ -1,7 +1,7 @@
 function [MatrixProfile, MPindex] = StompSelfJoinGPU(A, SubsequenceLength)
 % Compute the self similarity join of time series A
 % Usage:
-% [matrixProfile, matrixProfileIndex] = StompSelfJoin(A, subLen)
+% [matrixProfile, matrixProfileIndex] = StompSelfJoinGPU(A, subLen)
 % Output:
 %     matrixProfile: matrix porfile of the self-join (vector)
 %     matrixProfileIndex: matrix porfile index of the self-join (vector)
@@ -32,62 +32,47 @@ end
 MatrixProfileLength = length(A) - SubsequenceLength + 1;
 MatrixProfile = zeros(MatrixProfileLength, 1);
 MPindex = zeros(MatrixProfileLength, 1);
+
 [X, n, sumx2, sumx, meanx, sigmax2, sigmax] = ...
     fastfindNNPre(A, SubsequenceLength);
 
-%% compute the matrix profile
-dropval=0;
 distanceProfile=zeros(MatrixProfileLength,1);
 lastz=zeros(MatrixProfileLength,1);
-updatePos=false(MatrixProfileLength,1);
 
-% i=1
 subsequence = A(1:1+SubsequenceLength-1);
-[distanceProfile(:,1) lastz dropval lastsumy lastsumy2]= fastfindNN(X, subsequence, n, SubsequenceLength, ...
-            sumx2, sumx, meanx, sigmax2, sigmax);
-distanceProfile(:,1) = abs(distanceProfile);
-firstz=lastz;
+subsequence = subsequence(end:-1:1);                                %Reverse the query
+subsequence(SubsequenceLength+1:2*length(A)) = 0;
 
-% apply exclusion zone
-exclusionZoneStart = 1;
-exclusionZoneEnd = exclusionZone;
-distanceProfile(exclusionZoneStart:exclusionZoneEnd) = inf;
-        
-
-% evaluate initial matrix profile
-MatrixProfile(:) = distanceProfile;
-%MPindex(:) = 1;
-[dmin, idx] = min(distanceProfile);
-
-
+Y = fft(subsequence);
+Z = X.*Y;
+z = ifft(Z);
+lastz=real(z(SubsequenceLength:MatrixProfileLength));
 
 ProfileAndIndex = zeros(1,length(MatrixProfile),'uint64');
-fmin = typecast(single(dmin),'uint32');
 
-item = typecast([fmin idx], 'uint64');
-
-ProfileAndIndex(1) = item;
-
-for i = 2:length(MatrixProfile)
-    item = typecast(single(MatrixProfile(i)),'uint32');
+for i = 1:MatrixProfileLength
+    item = typecast(single(-inf),'uint32');
     ProfileAndIndex(i) = typecast([item, 1], 'uint64');
 end
 
-k = parallel.gpu.CUDAKernel('STOMP.ptx', 'STOMP.cu', 'WavefrontUpdateSelfJoin');
-k.ThreadBlockSize = [1024 1 1];
-k.GridSize = [ceil(length(MatrixProfile)/1024) 1 1];
+%Do not modify the following 3 lines unless you know exactly what you are doing
+%the block size of 512 is a template parameter to the compiled kernel if you change this you
+%will need to modify and recompile the source
+k = parallel.gpu.CUDAKernel('STOMP.ptx', 'STOMP.cu', 'WavefrontUpdateSelfJoinMaxSharedMem');
+k.ThreadBlockSize = [512 1 1];
+k.GridSize = [ceil(length(MatrixProfile)/512) 1 1];
 
 profile = gpuArray(ProfileAndIndex);
-MatrixProfile(:) = 0;
 MPindex(:) = 0;
+sigmax = 1 ./ sigmax;
+
 QT = gpuArray(lastz);
 Ta = gpuArray(A);
-Tb = gpuArray(A);
 means =gpuArray(meanx);
 stds = gpuArray(sigmax);
 t = tic();
 
-result = feval(k, QT, Ta, Tb, means, stds, profile, SubsequenceLength, length(MatrixProfile), 0, length(MatrixProfile), 1);
+result = feval(k, QT, Ta, Ta, stds, means, profile, SubsequenceLength, MatrixProfileLength, 0, 1);
 ProfileAndIndex = gather(result);
 gpuKernelTime = toc(t)
 for i = 1:length(MatrixProfile)
@@ -99,9 +84,9 @@ for i = 1:length(MatrixProfile)
         MPindex(i) = MPindex(i) + 1;
     end
     MatrixProfile(i) = itemMP(1);
-    %MatrixProfile(i) = typecast([MatrixProfile(i), 1], 'uint64');
 end
 
+MatrixProfile = sqrt(max(2 .* (SubsequenceLength - MatrixProfile), 0));
 
 % m is winSize
 function [X, n, sumx2, sumx, meanx, sigmax2, sigmax] = fastfindNNPre(x, m)
@@ -116,30 +101,3 @@ meanx = sumx./m;
 sigmax2 = (sumx2./m)-(meanx.^2);
 sigmax = sqrt(sigmax2);
 
-% m is winSieze
-function [dist lastz dropval sumy sumy2] = fastfindNN(X, y, n, m, sumx2, sumx, meanx, sigmax2, sigmax)
-%x is the data, y is the query
-%y = (y-mean(y))./std(y,1);                      %Normalize the query
-dropval=y(1);
-y = y(end:-1:1);                                %Reverse the query
-y(m+1:2*n) = 0;
-
-%The main trick of getting dot products in O(n log n) time
-Y = fft(y);
-Z = X.*Y;
-z = ifft(Z);
-
-%compute y stats -- O(n)
-sumy = sum(y);
-sumy2 = sum(y.^2);
-meany=sumy/m;
-sigmay2 = sumy2/m-meany^2;
-sigmay = sqrt(sigmay2);
-
-%computing the distances -- O(n) time
-%dist = (sumx2 - 2*sumx.*meanx + m*(meanx.^2))./sigmax2 - 2*(z(m:n) - sumy.*meanx)./sigmax + sumy2;
-%dist = 1-dist./(2*m);
-
-dist = 2*(m-(z(m:n)-m*meanx*meany)./(sigmax*sigmay));
-dist = sqrt(dist);
-lastz=real(z(m:n));
