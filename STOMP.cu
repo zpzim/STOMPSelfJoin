@@ -42,29 +42,29 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 template<class DTYPE>
 __global__ void sliding_mean(DTYPE* pref_sum,  size_t window, size_t size, DTYPE* means)
 {
-	const DTYPE coeff = 1.0 / (DTYPE) window;
-	size_t a = blockIdx.x * blockDim.x + threadIdx.x;
-	size_t b = blockIdx.x * blockDim.x + threadIdx.x + window;
+    const DTYPE coeff = 1.0 / (DTYPE) window;
+    size_t a = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t b = blockIdx.x * blockDim.x + threadIdx.x + window;
 
-	if(a == 0){
-		means[a] = pref_sum[window - 1] * coeff;
-	}
-	if(a < size - 1){
-		means[a + 1] = (pref_sum[b] - pref_sum[a]) * coeff;
-	}
+    if(a == 0){
+        means[a] = pref_sum[window - 1] * coeff;
+    }
+    if(a < size - 1){
+        means[a + 1] = (pref_sum[b] - pref_sum[a]) * coeff;
+    }
 }
 
 //This kernel computes the recipricol sliding standard deviaiton with specified window size, the corresponding means of each element, and the prefix squared sum at each element
 template<class DTYPE>
 __global__ void sliding_std(DTYPE* cumsumsqr, unsigned int window, unsigned int size, DTYPE* means, DTYPE* stds) {
-	const DTYPE coeff = 1 / (DTYPE) window;
-	int a = blockIdx.x * blockDim.x + threadIdx.x;
-	int b = blockIdx.x * blockDim.x + threadIdx.x + window;
-	if (a == 0) {
-		stds[a] = 1 / sqrt((cumsumsqr[window - 1] * coeff) - (means[a] * means[a]));
-	}
-	else if (b < size + window) {
-		stds[a] = 1 / sqrt(((cumsumsqr[b - 1] - cumsumsqr[a - 1]) * coeff) - (means[a] * means[a]));
+    const DTYPE coeff = 1 / (DTYPE) window;
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    int b = blockIdx.x * blockDim.x + threadIdx.x + window;
+    if (a == 0) {
+        stds[a] = 1 / sqrt((cumsumsqr[window - 1] * coeff) - (means[a] * means[a]));
+    }
+    else if (b < size + window) {
+        stds[a] = 1 / sqrt(((cumsumsqr[b - 1] - cumsumsqr[a - 1]) * coeff) - (means[a] * means[a]));
     }
 }
 
@@ -77,27 +77,27 @@ void compute_statistics(const DTYPE *T, DTYPE *means, DTYPE *stds, size_t n, siz
     
     DTYPE *scratch;
     cudaMalloc(&scratch, sizeof(DTYPE) * n);
-	gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk(cudaPeekAtLastError());
     
     thrust::device_ptr<const DTYPE> dev_ptr_T = thrust::device_pointer_cast(T);
     thrust::device_ptr<DTYPE> dev_ptr_scratch = thrust::device_pointer_cast(scratch);
 
     // Compute prefix sum in scratch
     thrust::inclusive_scan(thrust::cuda::par.on(s), dev_ptr_T, dev_ptr_T + n + m - 1, dev_ptr_scratch, thrust::plus<DTYPE>());
-	gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk(cudaPeekAtLastError());
     // Use prefix sum to compute sliding mean
     sliding_mean<DTYPE><<<grid, block, 0, s>>>(scratch, m, n, means);
-	gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk(cudaPeekAtLastError());
     // Compute prefix sum of squares in scratch
-	thrust::transform_inclusive_scan(thrust::cuda::par.on(s), dev_ptr_T, dev_ptr_T + n + m - 1, dev_ptr_scratch, sqr,thrust::plus<DTYPE>());
-	gpuErrchk(cudaPeekAtLastError());
+    thrust::transform_inclusive_scan(thrust::cuda::par.on(s), dev_ptr_T, dev_ptr_T + n + m - 1, dev_ptr_scratch, sqr,thrust::plus<DTYPE>());
+    gpuErrchk(cudaPeekAtLastError());
     // Use prefix sum of squares to compute the sliding standard deviation
-	sliding_std<DTYPE><<<grid, block, 0, s>>>(scratch, m, n, means, stds);
-	gpuErrchk(cudaPeekAtLastError());
+    sliding_std<DTYPE><<<grid, block, 0, s>>>(scratch, m, n, means, stds);
+    gpuErrchk(cudaPeekAtLastError());
     cudaStreamSynchronize(s);
-	gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk(cudaPeekAtLastError());
     cudaFree(scratch);
-	gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk(cudaPeekAtLastError());
 }
 
 template<class DTYPE>
@@ -125,7 +125,7 @@ __global__ void normalized_aligned_dot_products(const DTYPE* A, const DTYPE divi
                                                 const unsigned int m, const unsigned int n,
                                                 DTYPE* QT)
 {
-	int a = blockIdx.x * blockDim.x + threadIdx.x;
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a < n) {
         QT[a] = A[a + m - 1] / divisor;
     }
@@ -144,14 +144,14 @@ __global__ void populate_reverse_pad(const DTYPE *Q, DTYPE *Q_reverse_pad, const
 
 template<class DTYPE, class CUFFT_DTYPE>
 void sliding_dot_products_and_distance_profile(DTYPE* T, DTYPE* Q, DTYPE *QT, const int size, const int window_len, cudaStream_t s)
-{		
+{        
 
     const int n = size - window_len + 1;
     const int cufft_data_size = size / 2 + 1;
     dim3 grid(ceil(n / (float) WORK_SIZE), 1, 1);
     dim3 block(WORK_SIZE, 1, 1);
 
-    cufftHandle fft_plan, ifft_plan;	
+    cufftHandle fft_plan, ifft_plan;    
     DTYPE *Q_reverse_pad;
     CUFFT_DTYPE *Tc, *Qc;
     cufftPlan1d(&fft_plan, size, CUFFT_FORWARD_PLAN, 1);
@@ -164,26 +164,26 @@ void sliding_dot_products_and_distance_profile(DTYPE* T, DTYPE* Q, DTYPE *QT, co
     
     // Compute the FFT of the time series
     CUFFT_FORWARD__(fft_plan, T, Tc);
-	gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk(cudaPeekAtLastError());
 
     // Reverse and zero pad the query
     populate_reverse_pad<DTYPE><<<dim3(ceil(size / (float) WORK_SIZE),1,1), block, 0, s>>>(Q, Q_reverse_pad, window_len, size);
-	gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk(cudaPeekAtLastError());
     
     // Compute the FFT of the query
     CUFFT_FORWARD__(fft_plan, Q_reverse_pad, Qc);
-	gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk(cudaPeekAtLastError());
     
-	elementwise_multiply_inplace<<<dim3(ceil(cufft_data_size / (float) WORK_SIZE), 1, 1), block, 0, s>>>(Tc, Qc, cufft_data_size);
-	gpuErrchk(cudaPeekAtLastError());
+    elementwise_multiply_inplace<<<dim3(ceil(cufft_data_size / (float) WORK_SIZE), 1, 1), block, 0, s>>>(Tc, Qc, cufft_data_size);
+    gpuErrchk(cudaPeekAtLastError());
 
     // Compute the ifft
     // Use the space for the query as scratch space as we no longer need it
-	CUFFT_REVERSE__(ifft_plan, Qc, Q_reverse_pad);
-	gpuErrchk(cudaPeekAtLastError());
+    CUFFT_REVERSE__(ifft_plan, Qc, Q_reverse_pad);
+    gpuErrchk(cudaPeekAtLastError());
     
     normalized_aligned_dot_products<DTYPE><<<grid, block, 0, s>>>(Q_reverse_pad, size, window_len, n, QT);
-	gpuErrchk(cudaPeekAtLastError());
+    gpuErrchk(cudaPeekAtLastError());
     
     cudaFree(Q_reverse_pad);
     cudaFree(Tc);
@@ -200,26 +200,26 @@ void sliding_dot_products_and_distance_profile(DTYPE* T, DTYPE* Q, DTYPE *QT, co
 // to atomically update both the matrix profile and the indexes without using a critical section and dedicated locks.
 __device__ inline unsigned long long int MPatomicMax(volatile unsigned long long int* address, double val, unsigned int idx)
 {
-	float fval = (float)val;
-	mp_entry loc, loctest;
-	loc.floats[0] = fval;
-	loc.ints[1] = idx;
-	loctest.ulong = *address;
-	while (loctest.floats[0] < fval){
-		loctest.ulong = atomicCAS((unsigned long long int*) address, loctest.ulong,  loc.ulong);
-	}
-	return loctest.ulong;
+    float fval = (float)val;
+    mp_entry loc, loctest;
+    loc.floats[0] = fval;
+    loc.ints[1] = idx;
+    loctest.ulong = *address;
+    while (loctest.floats[0] < fval){
+        loctest.ulong = atomicCAS((unsigned long long int*) address, loctest.ulong,  loc.ulong);
+    }
+    return loctest.ulong;
 }
 
 template<unsigned int BLOCKSZ>
 //Updates the global matrix profile based on a block-local, cached version
 __device__ inline void UpdateMPGlobalMax(volatile unsigned long long* profile, volatile mp_entry* localMP, const int chunk, const int offset, const int n, const int factor){
-	
-	int x = chunk*(BLOCKSZ/factor)+threadIdx.x;
-	if(x < n && ((mp_entry*) profile)[x].floats[0] < localMP[threadIdx.x+offset].floats[0])
-	{
-			MPatomicMax(&profile[x], localMP[threadIdx.x+offset].floats[0], localMP[threadIdx.x+offset].ints[1]);
-	}
+    
+    int x = chunk*(BLOCKSZ/factor)+threadIdx.x;
+    if(x < n && ((mp_entry*) profile)[x].floats[0] < localMP[threadIdx.x+offset].floats[0])
+    {
+            MPatomicMax(&profile[x], localMP[threadIdx.x+offset].floats[0], localMP[threadIdx.x+offset].ints[1]);
+    }
 }
 
 
@@ -227,78 +227,78 @@ __device__ inline void UpdateMPGlobalMax(volatile unsigned long long* profile, v
 //Minimum shared memory usage is 5*sizeof(double)*WORK_SIZE + X. X varies with the value of factor. X = 10*sizeof(double)*WORK_SIZE / factor
 template<unsigned int BLOCKSZ>
 __global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const double* Ta, const double* Tb, const double* inv_stds, const double* means, unsigned long long int* profile, unsigned int m, unsigned int n, int startPos, int numDevices){
-	//Factor and threads per block must both be powers of two where: factor <= threads per block
-	//Use the smallest power of 2 possible for your GPU
-	const int factor = 8;
-	__shared__ volatile mp_entry localMPMain[WORK_SIZE + WORK_SIZE / factor];
-	__shared__ volatile mp_entry localMPOther[WORK_SIZE / factor];
-	__shared__ double A_low[WORK_SIZE + WORK_SIZE / factor];
-	__shared__ double A_high[WORK_SIZE + WORK_SIZE / factor];
-	__shared__ double inv_std_x[WORK_SIZE + WORK_SIZE / factor];
-	__shared__ double inv_std_y[WORK_SIZE / factor];
+    //Factor and threads per block must both be powers of two where: factor <= threads per block
+    //Use the smallest power of 2 possible for your GPU
+    const int factor = 8;
+    __shared__ volatile mp_entry localMPMain[WORK_SIZE + WORK_SIZE / factor];
+    __shared__ volatile mp_entry localMPOther[WORK_SIZE / factor];
+    __shared__ double A_low[WORK_SIZE + WORK_SIZE / factor];
+    __shared__ double A_high[WORK_SIZE + WORK_SIZE / factor];
+    __shared__ double inv_std_x[WORK_SIZE + WORK_SIZE / factor];
+    __shared__ double inv_std_y[WORK_SIZE / factor];
     __shared__ double mean_x[WORK_SIZE + WORK_SIZE / factor];
     __shared__ double mean_y[WORK_SIZE / factor];
-	__shared__ double B_high[WORK_SIZE / factor];
-	__shared__ double B_low[WORK_SIZE / factor];
-	__shared__ volatile bool updated[3];
+    __shared__ double B_high[WORK_SIZE / factor];
+    __shared__ double B_low[WORK_SIZE / factor];
+    __shared__ volatile bool updated[3];
 
 
-	int a = ((blockIdx.x * numDevices) + startPos) * BLOCKSZ + threadIdx.x;
-	//const int b = ((blockIdx.x * numDevices) + startPos + 1) * BLOCKSZ;
-	int exclusion = m / 4;
-	double qt_curr;
-	int localX = threadIdx.x;
-	int localY = 0;
-	int chunkIdxMain = (a / BLOCKSZ) * factor;
-	int chunkIdxOther = 0;
-	int mainStart = (BLOCKSZ / factor) * chunkIdxMain;
-	int otherStart = 0;
-	if(a < n){
-		qt_curr = QT[a];
-	}
+    int a = ((blockIdx.x * numDevices) + startPos) * BLOCKSZ + threadIdx.x;
+    //const int b = ((blockIdx.x * numDevices) + startPos + 1) * BLOCKSZ;
+    int exclusion = m / 4;
+    double qt_curr;
+    int localX = threadIdx.x;
+    int localY = 0;
+    int chunkIdxMain = (a / BLOCKSZ) * factor;
+    int chunkIdxOther = 0;
+    int mainStart = (BLOCKSZ / factor) * chunkIdxMain;
+    int otherStart = 0;
+    if(a < n){
+        qt_curr = QT[a];
+    }
     ////////////////////////////
-	//Initialize Shared Data
+    //Initialize Shared Data
     //////////////////////////
     // Cache the first chunk of the global matrix profile in shared memory
     // Each thread grabs two values from the first chunk
     
     // First value
-	if(mainStart+threadIdx.x < n){
-		localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
-	}else{
-		localMPMain[threadIdx.x].floats[0] = CC_MIN;
-		localMPMain[threadIdx.x].ints[1] = 0;
-	}
+    if(mainStart+threadIdx.x < n){
+        localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
+    }else{
+        localMPMain[threadIdx.x].floats[0] = CC_MIN;
+        localMPMain[threadIdx.x].ints[1] = 0;
+    }
     // Second value
-	if(threadIdx.x < BLOCKSZ / factor && mainStart+threadIdx.x+BLOCKSZ < n){
-		localMPMain[BLOCKSZ + threadIdx.x].ulong = profile[mainStart + BLOCKSZ + threadIdx.x];
-	}else if( threadIdx.x < BLOCKSZ / factor){
-		localMPMain[BLOCKSZ + threadIdx.x].floats[0] = CC_MIN;
-		localMPMain[BLOCKSZ + threadIdx.x].ints[1] = 0;
-	}
+    if(threadIdx.x < BLOCKSZ / factor && mainStart+threadIdx.x+BLOCKSZ < n){
+        localMPMain[BLOCKSZ + threadIdx.x].ulong = profile[mainStart + BLOCKSZ + threadIdx.x];
+    }else if( threadIdx.x < BLOCKSZ / factor){
+        localMPMain[BLOCKSZ + threadIdx.x].floats[0] = CC_MIN;
+        localMPMain[BLOCKSZ + threadIdx.x].ints[1] = 0;
+    }
 
     // We also need to keep track of the 'transposed' portion of our tile
     // We save time by only computing half of the distances because the matrix is symetric
-	if(threadIdx.x < BLOCKSZ / factor && otherStart+threadIdx.x < n){
-		localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
-	}else if(threadIdx.x < BLOCKSZ / factor){
-		localMPOther[threadIdx.x].floats[0] = CC_MIN;
-		localMPOther[threadIdx.x].ints[1] = 0;
-	}
+    if(threadIdx.x < BLOCKSZ / factor && otherStart+threadIdx.x < n){
+        localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
+    }else if(threadIdx.x < BLOCKSZ / factor){
+        localMPOther[threadIdx.x].floats[0] = CC_MIN;
+        localMPOther[threadIdx.x].ints[1] = 0;
+    }
 
     // Booleans indicating if the cache was updated
-	if(threadIdx.x == 0)
-	{
-		updated[0] = false;
-		updated[1] = false;
-		updated[2] = false;
-	}
+    if(threadIdx.x == 0)
+    {
+        updated[0] = false;
+        updated[1] = false;
+        updated[2] = false;
+    }
 
     // x is the global column of the distance matrix
     // y is the global row of the distance matrix
     // Each thread starts on the first row and works its way to the down-right diagonal
-	int x = a;
-	int y = 0;
+    int x = a;
+    int y = 0;
 
     // Cache the values from the original time series that we will need
     // A_low is the values on the lower side of the window, x
@@ -306,40 +306,40 @@ __global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const doub
     // Each thread grabs 4 values:
     // x, and x + BLOCKSZ for A_low
     // x + m, and x + m + BLOCKSZ for A_high
-	if (x < n) {
-		A_low[threadIdx.x] = Ta[x];
-	}
-	if (x + m < n + m - 1) {
-		A_high[threadIdx.x] = Ta[x + m];
-	}
-	if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ < n + m - 1) {
-		A_low[threadIdx.x + BLOCKSZ] = Ta[x + BLOCKSZ];
-	}
-	
-	if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ + m < n + m - 1) {
-		A_high[threadIdx.x + BLOCKSZ] = Ta[x + BLOCKSZ + m];
-	}
+    if (x < n) {
+        A_low[threadIdx.x] = Ta[x];
+    }
+    if (x + m < n + m - 1) {
+        A_high[threadIdx.x] = Ta[x + m];
+    }
+    if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ < n + m - 1) {
+        A_low[threadIdx.x + BLOCKSZ] = Ta[x + BLOCKSZ];
+    }
+    
+    if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ + m < n + m - 1) {
+        A_high[threadIdx.x + BLOCKSZ] = Ta[x + BLOCKSZ + m];
+    }
 
     // Cache the values of the means and standard deviations we will need for the
     // distances in this tile
-	if (a < n) {
+    if (a < n) {
         mean_x[threadIdx.x] = means[a];
-		inv_std_x[threadIdx.x] = inv_stds[a];
-	}
-	if(threadIdx.x < BLOCKSZ / factor && a + BLOCKSZ < n){
+        inv_std_x[threadIdx.x] = inv_stds[a];
+    }
+    if(threadIdx.x < BLOCKSZ / factor && a + BLOCKSZ < n){
         mean_x[threadIdx.x + BLOCKSZ] = means[a + BLOCKSZ];
-		inv_std_x[threadIdx.x + BLOCKSZ] = inv_stds[a + BLOCKSZ];
-	}
+        inv_std_x[threadIdx.x + BLOCKSZ] = inv_stds[a + BLOCKSZ];
+    }
 
     // We need to keep track of the original time series values corresponding to
     // y as well
-	if(threadIdx.x < BLOCKSZ / factor){
-		B_low[threadIdx.x] = Tb[threadIdx.x];
-		B_high[threadIdx.x] = Tb[threadIdx.x + m];
-		inv_std_y[threadIdx.x] = inv_stds[threadIdx.x];
+    if(threadIdx.x < BLOCKSZ / factor){
+        B_low[threadIdx.x] = Tb[threadIdx.x];
+        B_high[threadIdx.x] = Tb[threadIdx.x + m];
+        inv_std_y[threadIdx.x] = inv_stds[threadIdx.x];
         mean_y[threadIdx.x] = means[threadIdx.x];
-	}
-    /////////////////////////////////////	
+    }
+    /////////////////////////////////////    
     // Initialization done
     // Main loop
     /////////////////////////////////////
@@ -347,143 +347,143 @@ __global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const doub
     // We use a tiled approach for each thread block
     // The tiles are horizontal slices of the diagonal, think of a parallelogram cut
     // from a diagonal slice of the distance matrix 
-	while(mainStart < n && otherStart < n)
-	{
+    while(mainStart < n && otherStart < n)
+    {
         // Start of new tile, sync
-		__syncthreads();
-		
+        __syncthreads();
+        
         // Update the cached values to the end of the current tile
-		while(x < n && y < n && localY < BLOCKSZ / factor)
-		{
-			if(!(x > y - exclusion && x < y + exclusion))
-			{
-				//Compute the next correlation value
-				double dist = (qt_curr - (m * mean_x[localX] * mean_y[localY])) * inv_std_x[localX] * inv_std_y[localY];
+        while(x < n && y < n && localY < BLOCKSZ / factor)
+        {
+            if(!(x > y - exclusion && x < y + exclusion))
+            {
+                //Compute the next correlation value
+                double dist = (qt_curr - (m * mean_x[localX] * mean_y[localY])) * inv_std_x[localX] * inv_std_y[localY];
                 
                 //Check cache to see if we even need to try to update
                 if(localMPMain[localX].floats[0] < dist)
-				{	
-					//Update the cache with the new max value atomically
-					MPatomicMax((unsigned long long int*)&localMPMain[localX], dist, y);
-					if(localX < BLOCKSZ && !updated[0]){
-						updated[0] = true;
-					}else if(!updated[1]){
-						updated[1] = true;
-					}
-				}
-				//Check cache to see if we even need to try to update
-				if(localMPOther[localY].floats[0] < dist)
-				{
-					//Update the cache with the new max value atomically
-					MPatomicMax((unsigned long long int*)&localMPOther[localY], dist, x);
-					if(!updated[2]){
-						updated[2] = true;
-					}				
-				}
-			}
-            // Update the QT value for the next iteration	
-			qt_curr = qt_curr - A_low[localX] * B_low[localY] + A_high[localX]  * B_high[localY];
-			++x;
-			++y;
-			++localX;
-			++localY;
-		}
+                {    
+                    //Update the cache with the new max value atomically
+                    MPatomicMax((unsigned long long int*)&localMPMain[localX], dist, y);
+                    if(localX < BLOCKSZ && !updated[0]){
+                        updated[0] = true;
+                    }else if(!updated[1]){
+                        updated[1] = true;
+                    }
+                }
+                //Check cache to see if we even need to try to update
+                if(localMPOther[localY].floats[0] < dist)
+                {
+                    //Update the cache with the new max value atomically
+                    MPatomicMax((unsigned long long int*)&localMPOther[localY], dist, x);
+                    if(!updated[2]){
+                        updated[2] = true;
+                    }                
+                }
+            }
+            // Update the QT value for the next iteration    
+            qt_curr = qt_curr - A_low[localX] * B_low[localY] + A_high[localX]  * B_high[localY];
+            ++x;
+            ++y;
+            ++localX;
+            ++localY;
+        }
 
         // After this sync, the caches will be updated with the best so far values for this tile
-		__syncthreads();
-		
+        __syncthreads();
+        
         // If we updated any values in the cached MP, try to push them to the global "master" MP
-		if (updated[0]) {
-			UpdateMPGlobalMax<BLOCKSZ>(profile, localMPMain, chunkIdxMain, 0,n, factor);
-		}
-		if (updated[1] && threadIdx.x < BLOCKSZ / factor) {
-			UpdateMPGlobalMax<BLOCKSZ>(profile, localMPMain, chunkIdxMain + factor, BLOCKSZ, n, factor);
-		}
-		if (updated[2] && threadIdx.x < BLOCKSZ / factor) {
-			UpdateMPGlobalMax<BLOCKSZ>(profile, localMPOther, chunkIdxOther, 0,n, factor);
-		}
+        if (updated[0]) {
+            UpdateMPGlobalMax<BLOCKSZ>(profile, localMPMain, chunkIdxMain, 0,n, factor);
+        }
+        if (updated[1] && threadIdx.x < BLOCKSZ / factor) {
+            UpdateMPGlobalMax<BLOCKSZ>(profile, localMPMain, chunkIdxMain + factor, BLOCKSZ, n, factor);
+        }
+        if (updated[2] && threadIdx.x < BLOCKSZ / factor) {
+            UpdateMPGlobalMax<BLOCKSZ>(profile, localMPOther, chunkIdxOther, 0,n, factor);
+        }
 
-		__syncthreads();	
+        __syncthreads();    
 
         // Reset the updated flags
-		if (threadIdx.x == 0) {
-			updated[0] = false;
-			updated[1] = false;
-			updated[2] = false;
-		}		
+        if (threadIdx.x == 0) {
+            updated[0] = false;
+            updated[1] = false;
+            updated[2] = false;
+        }        
 
         // Update the tile position
-		mainStart += BLOCKSZ / factor;
-		otherStart += BLOCKSZ / factor;
+        mainStart += BLOCKSZ / factor;
+        otherStart += BLOCKSZ / factor;
 
-		// Update local cache to point to the next chunk of the MP
-		// We may not get the 'freshest' values from the global array, but it doesn't really matter too much
+        // Update local cache to point to the next chunk of the MP
+        // We may not get the 'freshest' values from the global array, but it doesn't really matter too much
         if (mainStart + threadIdx.x < n) {
-			localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
-		} else {
-			localMPMain[threadIdx.x].floats[0] = CC_MIN;
-			localMPMain[threadIdx.x].ints[1] = 0;
-		}
+            localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
+        } else {
+            localMPMain[threadIdx.x].floats[0] = CC_MIN;
+            localMPMain[threadIdx.x].ints[1] = 0;
+        }
 
         // Each thread grabs 2 values for the main cache
-		if (threadIdx.x < BLOCKSZ / factor && mainStart+threadIdx.x+BLOCKSZ < n) {
-			localMPMain[BLOCKSZ + threadIdx.x].ulong = profile[mainStart + BLOCKSZ + threadIdx.x];
-		} else if ( threadIdx.x < BLOCKSZ / factor) {
-			localMPMain[threadIdx.x + BLOCKSZ].floats[0] = CC_MIN;
-			localMPMain[threadIdx.x + BLOCKSZ].ints[1] = 0;
-		}
+        if (threadIdx.x < BLOCKSZ / factor && mainStart+threadIdx.x+BLOCKSZ < n) {
+            localMPMain[BLOCKSZ + threadIdx.x].ulong = profile[mainStart + BLOCKSZ + threadIdx.x];
+        } else if ( threadIdx.x < BLOCKSZ / factor) {
+            localMPMain[threadIdx.x + BLOCKSZ].floats[0] = CC_MIN;
+            localMPMain[threadIdx.x + BLOCKSZ].ints[1] = 0;
+        }
         
         // We also update the cache for the transposed tile
         if (threadIdx.x < BLOCKSZ / factor && otherStart+threadIdx.x < n) {
-			localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
-		} else if ( threadIdx.x < BLOCKSZ / factor) {
-			localMPOther[threadIdx.x].floats[0] = CC_MIN;
-			localMPOther[threadIdx.x].ints[1] = 0;
-		}
+            localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
+        } else if ( threadIdx.x < BLOCKSZ / factor) {
+            localMPOther[threadIdx.x].floats[0] = CC_MIN;
+            localMPOther[threadIdx.x].ints[1] = 0;
+        }
 
         // Update the other cached values to reflect the upcoming tile
         if (x <  n + m - 1) {
-			A_low[threadIdx.x] = Ta[x];
-		}
-		if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ < n + m - 1) {
-			A_low[threadIdx.x + BLOCKSZ] = Ta[x + BLOCKSZ];
-		}
-		
-		if (x + m < n + m - 1) {
-			A_high[threadIdx.x] = Ta[x + m];
-		}
-		if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ + m < n + m - 1) {
-			A_high[threadIdx.x + BLOCKSZ] = Ta[x + BLOCKSZ + m];
-		}
-		if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x < n + m - 1) {
-			B_low[threadIdx.x] = Tb[y + threadIdx.x];
-		}
-		if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x + m < n + m - 1) {
-			B_high[threadIdx.x] = Tb[y + threadIdx.x + m];
-		}
-		if (x < n) {
-			inv_std_x[threadIdx.x] = inv_stds[x];
-		    mean_x[threadIdx.x] = means[x];
+            A_low[threadIdx.x] = Ta[x];
         }
-		if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ < n) {
-			inv_std_x[threadIdx.x + BLOCKSZ] = inv_stds[x + BLOCKSZ];
+        if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ < n + m - 1) {
+            A_low[threadIdx.x + BLOCKSZ] = Ta[x + BLOCKSZ];
+        }
+        
+        if (x + m < n + m - 1) {
+            A_high[threadIdx.x] = Ta[x + m];
+        }
+        if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ + m < n + m - 1) {
+            A_high[threadIdx.x + BLOCKSZ] = Ta[x + BLOCKSZ + m];
+        }
+        if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x < n + m - 1) {
+            B_low[threadIdx.x] = Tb[y + threadIdx.x];
+        }
+        if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x + m < n + m - 1) {
+            B_high[threadIdx.x] = Tb[y + threadIdx.x + m];
+        }
+        if (x < n) {
+            inv_std_x[threadIdx.x] = inv_stds[x];
+            mean_x[threadIdx.x] = means[x];
+        }
+        if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ < n) {
+            inv_std_x[threadIdx.x + BLOCKSZ] = inv_stds[x + BLOCKSZ];
             mean_x[threadIdx.x + BLOCKSZ] = means[x + BLOCKSZ];
-		}
-		if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x < n) {
-			inv_std_y[threadIdx.x] = inv_stds[y + threadIdx.x];
+        }
+        if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x < n) {
+            inv_std_y[threadIdx.x] = inv_stds[y + threadIdx.x];
             mean_y[threadIdx.x] = means[y + threadIdx.x];
-		}
+        }
 
         // Reset the tile local positions
-		localY = 0;
-		localX = threadIdx.x;
-		chunkIdxMain++;
-		chunkIdxOther++;	
-	}
+        localY = 0;
+        localX = threadIdx.x;
+        chunkIdxMain++;
+        chunkIdxOther++;    
+    }
 }
 
 __global__ void cross_correlation_to_ed(float *profile, unsigned int n, unsigned int m) {
-	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if(tid < n) {
         profile[tid] = sqrt(max(2*(m - profile[tid]), 0.0));
     }
@@ -565,8 +565,9 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
         sliding_dot_products_and_distance_profile<DTYPE, CUFFT_DTYPE>(T_dev[device], T_dev[device], QT_dev[device], T_h.size(), m, streams.at(device));
         
         thrust::device_ptr<unsigned long long int> ptr = thrust::device_pointer_cast(profile_merged[device]);
-	    thrust::transform(thrust::cuda::par.on(streams.at(device)), profile_dev[device], profile_dev[device] + n, profile_idx_dev[device], profile_merged[device], combiner);
+        thrust::transform(thrust::cuda::par.on(streams.at(device)), profile_dev[device], profile_dev[device] + n, profile_idx_dev[device], profile_merged[device], combiner);
         printf("Start main kernel on GPU %d\n", device);
+        cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
         cudaEventRecord(clocks_start[device], streams.at(device));
         WavefrontUpdateSelfJoinMaxSharedMem<WORK_SIZE><<<dim3(ceil(num_workers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1), 0, streams.at(device)>>>(QT_dev[device], T_dev[device], T_dev[device], stds[device], means[device], profile_merged[device], m, n, count, devices.size());
         cudaEventRecord(clocks_end[device], streams.at(device));
@@ -662,18 +663,18 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
 template<class DTYPE>
 void readFile(const char* filename, vector<DTYPE>& v, const char *format_str) 
 {
-	FILE* f = fopen( filename, "r");
-	if(f == NULL){
-		printf("Unable to open %s for reading, please make sure it exists\n", filename);
-		exit(0);
-	}
-	DTYPE num;
-	while(!feof(f)){
-			fscanf(f, format_str, &num);
-			v.push_back(num);
-		}
-	v.pop_back();
-	fclose(f);
+    FILE* f = fopen( filename, "r");
+    if(f == NULL){
+        printf("Unable to open %s for reading, please make sure it exists\n", filename);
+        exit(0);
+    }
+    DTYPE num;
+    while(!feof(f)){
+            fscanf(f, format_str, &num);
+            v.push_back(num);
+        }
+    v.pop_back();
+    fclose(f);
 }
     
 
@@ -685,13 +686,13 @@ int main(int argc, char** argv) {
         exit(0);
     }
 
-	int window_size = atoi(argv[1]);
+    int window_size = atoi(argv[1]);
     
-	vector<double> T_h;
-	readFile<double>(argv[2], T_h, "%lf");
-	int n = T_h.size() - window_size + 1;
-	vector<float> profile(n, CC_MIN);
-	vector<unsigned int> profile_idx(n, 0);
+    vector<double> T_h;
+    readFile<double>(argv[2], T_h, "%lf");
+    int n = T_h.size() - window_size + 1;
+    vector<float> profile(n, CC_MIN);
+    vector<unsigned int> profile_idx(n, 0);
     
     cudaFree(0);
     
@@ -713,23 +714,23 @@ int main(int argc, char** argv) {
         }
     }
     
-	printf("Starting STOMP\n");
+    printf("Starting STOMP\n");
      
-	do_STOMP<double, cuDoubleComplex>(T_h, profile, profile_idx, window_size, devices);
-	
-	printf("Now writing result to files\n");
-	FILE* f1 = fopen( argv[3], "w");
-	FILE* f2 = fopen( argv[4], "w");
-	for(int i = 0; i < profile.size(); ++i){
-	    fprintf(f1, "%f\n", profile[i]);
-	    fprintf(f2, "%u\n", profile_idx[i] + 1);
-	}
-	gpuErrchk(cudaDeviceSynchronize());
-	gpuErrchk(cudaDeviceReset());
-	fclose(f1);
-	fclose(f2);
+    do_STOMP<double, cuDoubleComplex>(T_h, profile, profile_idx, window_size, devices);
+    
+    printf("Now writing result to files\n");
+    FILE* f1 = fopen( argv[3], "w");
+    FILE* f2 = fopen( argv[4], "w");
+    for(int i = 0; i < profile.size(); ++i){
+        fprintf(f1, "%f\n", profile[i]);
+        fprintf(f2, "%u\n", profile_idx[i] + 1);
+    }
+    gpuErrchk(cudaDeviceSynchronize());
+    gpuErrchk(cudaDeviceReset());
+    fclose(f1);
+    fclose(f2);
     printf("Done\n");
-	return 0;
+    return 0;
 }
 
 
