@@ -222,11 +222,86 @@ __device__ inline void UpdateMPGlobalMax(volatile unsigned long long* profile, v
     }
 }
 
+template<unsigned int BLOCKSZ, unsigned int factor>
+__device__ inline void initialize_tile_memory(const unsigned long long int *profile, const double *T,
+                                              const double *means, const double *inv_stds,
+                                              volatile mp_entry localMPMain[], volatile mp_entry localMPOther[],
+                                              double A_low[], double A_high[], double B_low[], double B_high[],
+                                              double mean_x[], double mean_y[], double inv_std_x[],
+                                              double inv_std_y[], volatile bool updated[],
+                                              const unsigned int n, const unsigned int m,
+                                              const unsigned int mainStart, const unsigned int otherStart,
+                                              const unsigned int x, const unsigned int y)
+{
+    // Reset the updated flags
+    // Booleans indicating if the cache was updated
+    if (threadIdx.x < 3) {
+        updated[threadIdx.x] = false;
+    }        
+
+    // Update local cache to point to the next chunk of the MP
+    // We may not get the 'freshest' values from the global array, but it doesn't really matter too much
+    if (mainStart + threadIdx.x < n) {
+        localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
+    } else {
+        localMPMain[threadIdx.x].floats[0] = CC_MIN;
+        localMPMain[threadIdx.x].ints[1] = 0;
+    }
+
+    // Each thread grabs 2 values for the main cache
+    if (threadIdx.x < BLOCKSZ / factor && mainStart+threadIdx.x+BLOCKSZ < n) {
+        localMPMain[BLOCKSZ + threadIdx.x].ulong = profile[mainStart + BLOCKSZ + threadIdx.x];
+    } else if ( threadIdx.x < BLOCKSZ / factor) {
+        localMPMain[threadIdx.x + BLOCKSZ].floats[0] = CC_MIN;
+        localMPMain[threadIdx.x + BLOCKSZ].ints[1] = 0;
+    }
+    
+    // We also update the cache for the transposed tile
+    if (threadIdx.x < BLOCKSZ / factor && otherStart+threadIdx.x < n) {
+        localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
+    } else if ( threadIdx.x < BLOCKSZ / factor) {
+        localMPOther[threadIdx.x].floats[0] = CC_MIN;
+        localMPOther[threadIdx.x].ints[1] = 0;
+    }
+
+    // Update the other cached values to reflect the upcoming tile
+    if (x <  n + m - 1) {
+        A_low[threadIdx.x] = T[x];
+    }
+    if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ < n + m - 1) {
+        A_low[threadIdx.x + BLOCKSZ] = T[x + BLOCKSZ];
+    }
+    
+    if (x + m < n + m - 1) {
+        A_high[threadIdx.x] = T[x + m];
+    }
+    if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ + m < n + m - 1) {
+        A_high[threadIdx.x + BLOCKSZ] = T[x + BLOCKSZ + m];
+    }
+    if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x < n + m - 1) {
+        B_low[threadIdx.x] = T[y + threadIdx.x];
+    }
+    if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x + m < n + m - 1) {
+        B_high[threadIdx.x] = T[y + threadIdx.x + m];
+    }
+    if (x < n) {
+        inv_std_x[threadIdx.x] = inv_stds[x];
+        mean_x[threadIdx.x] = means[x];
+    }
+    if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ < n) {
+        inv_std_x[threadIdx.x + BLOCKSZ] = inv_stds[x + BLOCKSZ];
+        mean_x[threadIdx.x + BLOCKSZ] = means[x + BLOCKSZ];
+    }
+    if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x < n) {
+        inv_std_y[threadIdx.x] = inv_stds[y + threadIdx.x];
+        mean_y[threadIdx.x] = means[y + threadIdx.x];
+    }
+}
 
 //Computes the matrix profile given the sliding dot products for the first query and the precomputed data statisics
 //Minimum shared memory usage is 5*sizeof(double)*WORK_SIZE + X. X varies with the value of factor. X = 10*sizeof(double)*WORK_SIZE / factor
 template<unsigned int BLOCKSZ>
-__global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const double* Ta, const double* Tb, const double* inv_stds, const double* means, unsigned long long int* profile, unsigned int m, unsigned int n, int startPos, int numDevices){
+__global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const double* T, const double* inv_stds, const double* means, unsigned long long int* profile, unsigned int m, unsigned int n, int startPos, int numDevices){
     //Factor and threads per block must both be powers of two where: factor <= threads per block
     //Use the smallest power of 2 possible for your GPU
     const int factor = 8;
@@ -256,91 +331,19 @@ __global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const doub
     if(a < n){
         qt_curr = QT[a];
     }
-    ////////////////////////////
-    //Initialize Shared Data
-    //////////////////////////
-    // Cache the first chunk of the global matrix profile in shared memory
-    // Each thread grabs two values from the first chunk
     
-    // First value
-    if(mainStart+threadIdx.x < n){
-        localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
-    }else{
-        localMPMain[threadIdx.x].floats[0] = CC_MIN;
-        localMPMain[threadIdx.x].ints[1] = 0;
-    }
-    // Second value
-    if(threadIdx.x < BLOCKSZ / factor && mainStart+threadIdx.x+BLOCKSZ < n){
-        localMPMain[BLOCKSZ + threadIdx.x].ulong = profile[mainStart + BLOCKSZ + threadIdx.x];
-    }else if( threadIdx.x < BLOCKSZ / factor){
-        localMPMain[BLOCKSZ + threadIdx.x].floats[0] = CC_MIN;
-        localMPMain[BLOCKSZ + threadIdx.x].ints[1] = 0;
-    }
-
-    // We also need to keep track of the 'transposed' portion of our tile
-    // We save time by only computing half of the distances because the matrix is symetric
-    if(threadIdx.x < BLOCKSZ / factor && otherStart+threadIdx.x < n){
-        localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
-    }else if(threadIdx.x < BLOCKSZ / factor){
-        localMPOther[threadIdx.x].floats[0] = CC_MIN;
-        localMPOther[threadIdx.x].ints[1] = 0;
-    }
-
-    // Booleans indicating if the cache was updated
-    if(threadIdx.x == 0)
-    {
-        updated[0] = false;
-        updated[1] = false;
-        updated[2] = false;
-    }
-
     // x is the global column of the distance matrix
     // y is the global row of the distance matrix
     // Each thread starts on the first row and works its way to the down-right diagonal
     int x = a;
     int y = 0;
-
-    // Cache the values from the original time series that we will need
-    // A_low is the values on the lower side of the window, x
-    // A_high is the values on the upper side of the window, x + m
-    // Each thread grabs 4 values:
-    // x, and x + BLOCKSZ for A_low
-    // x + m, and x + m + BLOCKSZ for A_high
-    if (x < n) {
-        A_low[threadIdx.x] = Ta[x];
-    }
-    if (x + m < n + m - 1) {
-        A_high[threadIdx.x] = Ta[x + m];
-    }
-    if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ < n + m - 1) {
-        A_low[threadIdx.x + BLOCKSZ] = Ta[x + BLOCKSZ];
-    }
     
-    if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ + m < n + m - 1) {
-        A_high[threadIdx.x + BLOCKSZ] = Ta[x + BLOCKSZ + m];
-    }
+    // Initialize the first tile's shared memory 
+    initialize_tile_memory<BLOCKSZ, factor>(profile, T, means, inv_stds, localMPMain, localMPOther,
+                                            A_low, A_high, B_low, B_high, mean_x, mean_y, inv_std_x,
+                                            inv_std_y, updated, n, m, mainStart, otherStart, x, y);
 
-    // Cache the values of the means and standard deviations we will need for the
-    // distances in this tile
-    if (a < n) {
-        mean_x[threadIdx.x] = means[a];
-        inv_std_x[threadIdx.x] = inv_stds[a];
-    }
-    if(threadIdx.x < BLOCKSZ / factor && a + BLOCKSZ < n){
-        mean_x[threadIdx.x + BLOCKSZ] = means[a + BLOCKSZ];
-        inv_std_x[threadIdx.x + BLOCKSZ] = inv_stds[a + BLOCKSZ];
-    }
-
-    // We need to keep track of the original time series values corresponding to
-    // y as well
-    if(threadIdx.x < BLOCKSZ / factor){
-        B_low[threadIdx.x] = Tb[threadIdx.x];
-        B_high[threadIdx.x] = Tb[threadIdx.x + m];
-        inv_std_y[threadIdx.x] = inv_stds[threadIdx.x];
-        mean_y[threadIdx.x] = means[threadIdx.x];
-    }
     /////////////////////////////////////    
-    // Initialization done
     // Main loop
     /////////////////////////////////////
     // Each threadblock finds all the distances on a 'metadiagonal'
@@ -405,74 +408,14 @@ __global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const doub
 
         __syncthreads();    
 
-        // Reset the updated flags
-        if (threadIdx.x == 0) {
-            updated[0] = false;
-            updated[1] = false;
-            updated[2] = false;
-        }        
-
         // Update the tile position
         mainStart += BLOCKSZ / factor;
         otherStart += BLOCKSZ / factor;
-
-        // Update local cache to point to the next chunk of the MP
-        // We may not get the 'freshest' values from the global array, but it doesn't really matter too much
-        if (mainStart + threadIdx.x < n) {
-            localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
-        } else {
-            localMPMain[threadIdx.x].floats[0] = CC_MIN;
-            localMPMain[threadIdx.x].ints[1] = 0;
-        }
-
-        // Each thread grabs 2 values for the main cache
-        if (threadIdx.x < BLOCKSZ / factor && mainStart+threadIdx.x+BLOCKSZ < n) {
-            localMPMain[BLOCKSZ + threadIdx.x].ulong = profile[mainStart + BLOCKSZ + threadIdx.x];
-        } else if ( threadIdx.x < BLOCKSZ / factor) {
-            localMPMain[threadIdx.x + BLOCKSZ].floats[0] = CC_MIN;
-            localMPMain[threadIdx.x + BLOCKSZ].ints[1] = 0;
-        }
-        
-        // We also update the cache for the transposed tile
-        if (threadIdx.x < BLOCKSZ / factor && otherStart+threadIdx.x < n) {
-            localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
-        } else if ( threadIdx.x < BLOCKSZ / factor) {
-            localMPOther[threadIdx.x].floats[0] = CC_MIN;
-            localMPOther[threadIdx.x].ints[1] = 0;
-        }
-
-        // Update the other cached values to reflect the upcoming tile
-        if (x <  n + m - 1) {
-            A_low[threadIdx.x] = Ta[x];
-        }
-        if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ < n + m - 1) {
-            A_low[threadIdx.x + BLOCKSZ] = Ta[x + BLOCKSZ];
-        }
-        
-        if (x + m < n + m - 1) {
-            A_high[threadIdx.x] = Ta[x + m];
-        }
-        if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ + m < n + m - 1) {
-            A_high[threadIdx.x + BLOCKSZ] = Ta[x + BLOCKSZ + m];
-        }
-        if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x < n + m - 1) {
-            B_low[threadIdx.x] = Tb[y + threadIdx.x];
-        }
-        if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x + m < n + m - 1) {
-            B_high[threadIdx.x] = Tb[y + threadIdx.x + m];
-        }
-        if (x < n) {
-            inv_std_x[threadIdx.x] = inv_stds[x];
-            mean_x[threadIdx.x] = means[x];
-        }
-        if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ < n) {
-            inv_std_x[threadIdx.x + BLOCKSZ] = inv_stds[x + BLOCKSZ];
-            mean_x[threadIdx.x + BLOCKSZ] = means[x + BLOCKSZ];
-        }
-        if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x < n) {
-            inv_std_y[threadIdx.x] = inv_stds[y + threadIdx.x];
-            mean_y[threadIdx.x] = means[y + threadIdx.x];
-        }
+    
+        // Initialize the next tile's shared memory 
+        initialize_tile_memory<BLOCKSZ, factor>(profile, T, means, inv_stds, localMPMain, localMPOther,
+                                                A_low, A_high, B_low, B_high, mean_x, mean_y, inv_std_x,
+                                                inv_std_y, updated, n, m, mainStart, otherStart, x, y);
 
         // Reset the tile local positions
         localY = 0;
@@ -569,7 +512,7 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
         printf("Start main kernel on GPU %d\n", device);
         cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
         cudaEventRecord(clocks_start[device], streams.at(device));
-        WavefrontUpdateSelfJoinMaxSharedMem<WORK_SIZE><<<dim3(ceil(num_workers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1), 0, streams.at(device)>>>(QT_dev[device], T_dev[device], T_dev[device], stds[device], means[device], profile_merged[device], m, n, count, devices.size());
+        WavefrontUpdateSelfJoinMaxSharedMem<WORK_SIZE><<<dim3(ceil(num_workers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1), 0, streams.at(device)>>>(QT_dev[device], T_dev[device], stds[device], means[device], profile_merged[device], m, n, count, devices.size());
         cudaEventRecord(clocks_end[device], streams.at(device));
         ++count;
     }
