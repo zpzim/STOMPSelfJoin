@@ -409,6 +409,9 @@ __global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const doub
             qt_curr = mem.qt[0];
 
             // Finish the remaining iterations of the tile
+            // This should only execute in the final tile that this thread works on
+            // For this reason the value in qt_curr after this loop does not need to be saved!
+            // TODO: we should be able to move this out of the main loop entirely
             while (x < n && localY < tile_height) {
                 float dist = (static_cast<float>(qt_curr) - (mean_x[localX] * mean_y[localY])) * inv_std_x[localX] * inv_std_y[localY];
                 qt_curr = qt_curr - A_low[localX] * B_low[localY] + A_high[localX] * B_high[localY];
@@ -420,6 +423,11 @@ __global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const doub
                 localX++;
                 localY++;
             }
+            
+            // This should not need to be here, but we add it for redundancy in the case
+            // of a strange combination of BLOCKSZ, factor, and UNROLL_COUNT which could
+            // have us execute some iterations of the above loop for every tile
+            mem.qt[0] = qt_curr;
 
         }
 
