@@ -24,7 +24,7 @@ using std::unordered_map;
 using std::make_pair;
 
 static const unsigned int WORK_SIZE = 512;
-
+static const unsigned int AMT_UNROLL = 4;
 
 //This macro checks return value of the CUDA runtime call and exits
 //the application if the call failed.
@@ -54,7 +54,8 @@ __global__ void sliding_mean(DTYPE* pref_sum,  size_t window, size_t size, DTYPE
     }
 }
 
-//This kernel computes the recipricol sliding standard deviaiton with specified window size, the corresponding means of each element, and the prefix squared sum at each element
+// This kernel computes the recipricol sliding standard deviaiton with specified window size, the corresponding means of each element, and the prefix squared sum at each element
+// We actually compute the multiplicative inverse of the standard deviation, as this saves us from needing to do a division in the main kernel
 template<class DTYPE>
 __global__ void sliding_std(DTYPE* cumsumsqr, unsigned int window, unsigned int size, DTYPE* means, DTYPE* stds) {
     const DTYPE coeff = 1 / (DTYPE) window;
@@ -198,47 +199,38 @@ void sliding_dot_products_and_distance_profile(DTYPE* T, DTYPE* Q, DTYPE *QT, co
 
 //Atomically updates the MP/idxs using a single 64-bit integer. We lose a small amount of precision in the output, if we do not do this we are unable
 // to atomically update both the matrix profile and the indexes without using a critical section and dedicated locks.
-__device__ inline unsigned long long int MPatomicMax(volatile unsigned long long int* address, double val, unsigned int idx)
+__device__ inline void MPatomicMax(volatile unsigned long long int* address, float val, unsigned int idx)
 {
-    float fval = (float)val;
     mp_entry loc, loctest;
-    loc.floats[0] = fval;
+    loc.floats[0] = val;
     loc.ints[1] = idx;
     loctest.ulong = *address;
-    while (loctest.floats[0] < fval){
+    while (loctest.floats[0] < val){
         loctest.ulong = atomicCAS((unsigned long long int*) address, loctest.ulong,  loc.ulong);
     }
-    return loctest.ulong;
 }
 
-template<unsigned int BLOCKSZ>
+template<unsigned int tile_height>
 //Updates the global matrix profile based on a block-local, cached version
-__device__ inline void UpdateMPGlobalMax(volatile unsigned long long* profile, volatile mp_entry* localMP, const int chunk, const int offset, const int n, const int factor){
+__device__ inline void UpdateMPGlobalMax(unsigned long long* profile, volatile mp_entry* localMP, const int chunk, const int offset, const int n){
     
-    int x = chunk*(BLOCKSZ/factor)+threadIdx.x;
+    int x = chunk*(tile_height)+threadIdx.x;
     if(x < n && ((mp_entry*) profile)[x].floats[0] < localMP[threadIdx.x+offset].floats[0])
     {
             MPatomicMax(&profile[x], localMP[threadIdx.x+offset].floats[0], localMP[threadIdx.x+offset].ints[1]);
     }
 }
 
-template<unsigned int BLOCKSZ, unsigned int factor>
+template<class DTYPE, unsigned int BLOCKSZ, unsigned int tile_height>
 __device__ inline void initialize_tile_memory(const unsigned long long int *profile, const double *T,
                                               const double *means, const double *inv_stds,
                                               volatile mp_entry localMPMain[], volatile mp_entry localMPOther[],
-                                              double A_low[], double A_high[], double B_low[], double B_high[],
-                                              double mean_x[], double mean_y[], double inv_std_x[],
-                                              double inv_std_y[], volatile bool updated[],
-                                              const unsigned int n, const unsigned int m,
+                                              DTYPE A_low[], DTYPE A_high[], DTYPE B_low[], DTYPE B_high[],
+                                              DTYPE mean_x[], DTYPE mean_y[], DTYPE inv_std_x[],
+                                              DTYPE inv_std_y[], const unsigned int n, const unsigned int m,
                                               const unsigned int mainStart, const unsigned int otherStart,
                                               const unsigned int x, const unsigned int y)
 {
-    // Reset the updated flags
-    // Booleans indicating if the cache was updated
-    if (threadIdx.x < 3) {
-        updated[threadIdx.x] = false;
-    }        
-
     // Update local cache to point to the next chunk of the MP
     // We may not get the 'freshest' values from the global array, but it doesn't really matter too much
     if (mainStart + threadIdx.x < n) {
@@ -249,17 +241,17 @@ __device__ inline void initialize_tile_memory(const unsigned long long int *prof
     }
 
     // Each thread grabs 2 values for the main cache
-    if (threadIdx.x < BLOCKSZ / factor && mainStart+threadIdx.x+BLOCKSZ < n) {
+    if (threadIdx.x < tile_height && mainStart+threadIdx.x+BLOCKSZ < n) {
         localMPMain[BLOCKSZ + threadIdx.x].ulong = profile[mainStart + BLOCKSZ + threadIdx.x];
-    } else if ( threadIdx.x < BLOCKSZ / factor) {
+    } else if (threadIdx.x < tile_height) {
         localMPMain[threadIdx.x + BLOCKSZ].floats[0] = CC_MIN;
         localMPMain[threadIdx.x + BLOCKSZ].ints[1] = 0;
     }
     
     // We also update the cache for the transposed tile
-    if (threadIdx.x < BLOCKSZ / factor && otherStart+threadIdx.x < n) {
+    if (threadIdx.x < tile_height && otherStart+threadIdx.x < n) {
         localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
-    } else if ( threadIdx.x < BLOCKSZ / factor) {
+    } else if (threadIdx.x < tile_height) {
         localMPOther[threadIdx.x].floats[0] = CC_MIN;
         localMPOther[threadIdx.x].ints[1] = 0;
     }
@@ -268,68 +260,75 @@ __device__ inline void initialize_tile_memory(const unsigned long long int *prof
     if (x <  n + m - 1) {
         A_low[threadIdx.x] = T[x];
     }
-    if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ < n + m - 1) {
+    if (threadIdx.x < tile_height && x + BLOCKSZ < n + m - 1) {
         A_low[threadIdx.x + BLOCKSZ] = T[x + BLOCKSZ];
     }
     
     if (x + m < n + m - 1) {
         A_high[threadIdx.x] = T[x + m];
     }
-    if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ + m < n + m - 1) {
+    if (threadIdx.x < tile_height && x + BLOCKSZ + m < n + m - 1) {
         A_high[threadIdx.x + BLOCKSZ] = T[x + BLOCKSZ + m];
     }
-    if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x < n + m - 1) {
+    if (threadIdx.x < tile_height && y + threadIdx.x < n + m - 1) {
         B_low[threadIdx.x] = T[y + threadIdx.x];
     }
-    if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x + m < n + m - 1) {
+    if (threadIdx.x < tile_height && y + threadIdx.x + m < n + m - 1) {
         B_high[threadIdx.x] = T[y + threadIdx.x + m];
     }
     if (x < n) {
         inv_std_x[threadIdx.x] = inv_stds[x];
-        mean_x[threadIdx.x] = means[x];
+        // We precompute part of the distance calculation in the mean_x variable
+        // This saves us a multiply in the main loop
+        mean_x[threadIdx.x] = means[x] * m;
     }
-    if (threadIdx.x < BLOCKSZ / factor && x + BLOCKSZ < n) {
+    if (threadIdx.x < tile_height && x + BLOCKSZ < n) {
         inv_std_x[threadIdx.x + BLOCKSZ] = inv_stds[x + BLOCKSZ];
-        mean_x[threadIdx.x + BLOCKSZ] = means[x + BLOCKSZ];
+        // We precompute part of the distance calculation in the mean_x variable
+        // This saves us a multiply in the main loop
+        mean_x[threadIdx.x + BLOCKSZ] = means[x + BLOCKSZ] * m;
     }
-    if (threadIdx.x < BLOCKSZ / factor && y + threadIdx.x < n) {
+    if (threadIdx.x < tile_height && y + threadIdx.x < n) {
         inv_std_y[threadIdx.x] = inv_stds[y + threadIdx.x];
         mean_y[threadIdx.x] = means[y + threadIdx.x];
     }
 }
 
 //Computes the matrix profile given the sliding dot products for the first query and the precomputed data statisics
-//Minimum shared memory usage is 5*sizeof(double)*WORK_SIZE + X. X varies with the value of factor. X = 10*sizeof(double)*WORK_SIZE / factor
-template<unsigned int BLOCKSZ>
-__global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const double* T, const double* inv_stds, const double* means, unsigned long long int* profile, unsigned int m, unsigned int n, int startPos, int numDevices){
+template<class DTYPE, unsigned int BLOCKSZ, unsigned int UNROLL_COUNT>
+__global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const double* T, const double* inv_stds, const double* means, unsigned long long int* profile, unsigned int m, unsigned int n, int startPos, int numDevices, struct reg_mem<UNROLL_COUNT> mem)
+{
     //Factor and threads per block must both be powers of two where: factor <= threads per block
+    // UNROLL_COUNT * factor must also evenly divide WORK_SIZE
+    // The values that are set here should give good performance already
+    // but may be fine tuned for other Nvidia architectures
     //Use the smallest power of 2 possible for your GPU
-    const int factor = 8;
-    __shared__ volatile mp_entry localMPMain[WORK_SIZE + WORK_SIZE / factor];
-    __shared__ volatile mp_entry localMPOther[WORK_SIZE / factor];
-    __shared__ double A_low[WORK_SIZE + WORK_SIZE / factor];
-    __shared__ double A_high[WORK_SIZE + WORK_SIZE / factor];
-    __shared__ double inv_std_x[WORK_SIZE + WORK_SIZE / factor];
-    __shared__ double inv_std_y[WORK_SIZE / factor];
-    __shared__ double mean_x[WORK_SIZE + WORK_SIZE / factor];
-    __shared__ double mean_y[WORK_SIZE / factor];
-    __shared__ double B_high[WORK_SIZE / factor];
-    __shared__ double B_low[WORK_SIZE / factor];
-    __shared__ volatile bool updated[3];
+    const int factor = 4;
+    const int tile_height = BLOCKSZ / factor;
+    const int tile_width = tile_height + BLOCKSZ;
+    __shared__ mp_entry localMPMain[tile_width];
+    __shared__ mp_entry localMPOther[tile_height];
+    __shared__ DTYPE A_low[tile_width];
+    __shared__ DTYPE A_high[tile_width];
+    __shared__ DTYPE inv_std_x[tile_width];
+    __shared__ DTYPE inv_std_y[tile_height];
+    __shared__ DTYPE mean_x[tile_width];
+    __shared__ DTYPE mean_y[tile_height];
+    __shared__ DTYPE B_high[tile_height];
+    __shared__ DTYPE B_low[tile_height];
 
 
+    int exclusion = (m / 4);
     int a = ((blockIdx.x * numDevices) + startPos) * BLOCKSZ + threadIdx.x;
-    //const int b = ((blockIdx.x * numDevices) + startPos + 1) * BLOCKSZ;
-    int exclusion = m / 4;
     double qt_curr;
     int localX = threadIdx.x;
     int localY = 0;
     int chunkIdxMain = (a / BLOCKSZ) * factor;
     int chunkIdxOther = 0;
-    int mainStart = (BLOCKSZ / factor) * chunkIdxMain;
+    int mainStart = tile_height * chunkIdxMain;
     int otherStart = 0;
-    if(a < n){
-        qt_curr = QT[a];
+    if (a < n) {
+        mem.qt[0] = QT[a];
     }
     
     // x is the global column of the distance matrix
@@ -337,11 +336,19 @@ __global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const doub
     // Each thread starts on the first row and works its way to the down-right diagonal
     int x = a;
     int y = 0;
-    
+
+    // The first threads are acutally computing the trivial match between the same subsequence
+    // we exclude these from the calculation
+    bool excluded;
+    if (x <= exclusion) {
+        excluded = true;
+    } else {
+        excluded = false;
+    }
     // Initialize the first tile's shared memory 
-    initialize_tile_memory<BLOCKSZ, factor>(profile, T, means, inv_stds, localMPMain, localMPOther,
+    initialize_tile_memory<DTYPE, BLOCKSZ, tile_height>(profile, T, means, inv_stds, localMPMain, localMPOther,
                                             A_low, A_high, B_low, B_high, mean_x, mean_y, inv_std_x,
-                                            inv_std_y, updated, n, m, mainStart, otherStart, x, y);
+                                            inv_std_y, n, m, mainStart, otherStart, x, y);
 
     /////////////////////////////////////    
     // Main loop
@@ -350,72 +357,94 @@ __global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const doub
     // We use a tiled approach for each thread block
     // The tiles are horizontal slices of the diagonal, think of a parallelogram cut
     // from a diagonal slice of the distance matrix 
-    while(mainStart < n && otherStart < n)
+    while (mainStart < n && otherStart < n)
     {
         // Start of new tile, sync
         __syncthreads();
-        
-        // Update the cached values to the end of the current tile
-        while(x < n && y < n && localY < BLOCKSZ / factor)
-        {
-            if(!(x > y - exclusion && x < y + exclusion))
+
+        // The first 'm/4' diagonals are computing the exclusion zone, so we don't want to
+        // include their distances in the calculation
+        if (excluded) {
+                x += tile_height;
+                y += tile_height;
+        } else {
+            // Process the tile
+            // Each iteration generates the next 4 distances
+            // This loop is partially unrolled to improve instruction level parallelism
+            while (x < n - UNROLL_COUNT + 1 && localY < tile_height)
             {
-                //Compute the next correlation value
-                double dist = (qt_curr - (m * mean_x[localX] * mean_y[localY])) * inv_std_x[localX] * inv_std_y[localY];
+                // Update the QT value for the next iteration
+                #pragma unroll
+                for (int i = 0; i < UNROLL_COUNT - 1; ++i) {
+                    mem.qt[i + 1] = mem.qt[i] - A_low[localX + i] * B_low[localY + i] + A_high[localX + i] * B_high[localY + i];
+                }
                 
-                //Check cache to see if we even need to try to update
-                if(localMPMain[localX].floats[0] < dist)
-                {    
-                    //Update the cache with the new max value atomically
-                    MPatomicMax((unsigned long long int*)&localMPMain[localX], dist, y);
-                    if(localX < BLOCKSZ && !updated[0]){
-                        updated[0] = true;
-                    }else if(!updated[1]){
-                        updated[1] = true;
-                    }
+                // Compute the next partial distance value
+                // We defer some of the calculation until after the kernel has finished, this saves us several
+                // long latency math operations in this critical path.
+                // The distance computed here can be converted to the true z-normalized euclidan
+                // distance in constant time
+                // mean_x has already been multiplied with the window size 'm' when the tile was populated
+                #pragma unroll
+                for (int i = 0; i < UNROLL_COUNT; ++i) {
+                    mem.dist[i] = (static_cast<float>(mem.qt[i]) - (mean_x[localX + i] * mean_y[localY + i])) * inv_std_x[localX + i] * inv_std_y[localY + i];
                 }
-                //Check cache to see if we even need to try to update
-                if(localMPOther[localY].floats[0] < dist)
-                {
-                    //Update the cache with the new max value atomically
-                    MPatomicMax((unsigned long long int*)&localMPOther[localY], dist, x);
-                    if(!updated[2]){
-                        updated[2] = true;
-                    }                
+
+
+                mem.qt[0] = mem.qt[UNROLL_COUNT - 1] - A_low[localX + UNROLL_COUNT - 1] * B_low[localY + UNROLL_COUNT - 1] + A_high[localX + UNROLL_COUNT - 1] * B_high[localY + UNROLL_COUNT - 1];
+
+                // Update the cache with the new max value atomically
+                #pragma unroll
+                for (int i = 0; i < UNROLL_COUNT; ++i) {
+                    MPatomicMax((unsigned long long int*) (localMPMain + localX + i), mem.dist[i], y + i);
+                    MPatomicMax((unsigned long long int*) (localMPOther + localY + i), mem.dist[i], x + i);
                 }
+
+                x += UNROLL_COUNT;
+                y += UNROLL_COUNT;
+                localX += UNROLL_COUNT;
+                localY += UNROLL_COUNT;
             }
-            // Update the QT value for the next iteration    
-            qt_curr = qt_curr - A_low[localX] * B_low[localY] + A_high[localX]  * B_high[localY];
-            ++x;
-            ++y;
-            ++localX;
-            ++localY;
+
+            qt_curr = mem.qt[0];
+
+            // Finish the remaining iterations of the tile
+            while (x < n && localY < tile_height) {
+                float dist = (static_cast<float>(qt_curr) - (mean_x[localX] * mean_y[localY])) * inv_std_x[localX] * inv_std_y[localY];
+                qt_curr = qt_curr - A_low[localX] * B_low[localY] + A_high[localX] * B_high[localY];
+                MPatomicMax((unsigned long long int*) (localMPMain + localX), dist, y);
+                MPatomicMax((unsigned long long int*) (localMPOther + localY), dist, x);
+
+                x++;
+                y++;
+                localX++;
+                localY++;
+            }
+
         }
 
         // After this sync, the caches will be updated with the best so far values for this tile
         __syncthreads();
-        
+
         // If we updated any values in the cached MP, try to push them to the global "master" MP
-        if (updated[0]) {
-            UpdateMPGlobalMax<BLOCKSZ>(profile, localMPMain, chunkIdxMain, 0,n, factor);
-        }
-        if (updated[1] && threadIdx.x < BLOCKSZ / factor) {
-            UpdateMPGlobalMax<BLOCKSZ>(profile, localMPMain, chunkIdxMain + factor, BLOCKSZ, n, factor);
-        }
-        if (updated[2] && threadIdx.x < BLOCKSZ / factor) {
-            UpdateMPGlobalMax<BLOCKSZ>(profile, localMPOther, chunkIdxOther, 0,n, factor);
+        UpdateMPGlobalMax<tile_height>(profile, localMPMain, chunkIdxMain, 0, n);
+        if (threadIdx.x < tile_height) {
+            UpdateMPGlobalMax<tile_height>(profile, localMPMain, chunkIdxMain + factor, BLOCKSZ, n);
+            UpdateMPGlobalMax<tile_height>(profile, localMPOther, chunkIdxOther, 0, n);
         }
 
-        __syncthreads();    
 
         // Update the tile position
-        mainStart += BLOCKSZ / factor;
-        otherStart += BLOCKSZ / factor;
+        mainStart += tile_height;
+        otherStart += tile_height;
+
+        // Make sure our updates were committed before we pull in the next tile
+        __threadfence_block();
     
         // Initialize the next tile's shared memory 
-        initialize_tile_memory<BLOCKSZ, factor>(profile, T, means, inv_stds, localMPMain, localMPOther,
+        initialize_tile_memory<DTYPE, BLOCKSZ, tile_height>(profile, T, means, inv_stds, localMPMain, localMPOther,
                                                 A_low, A_high, B_low, B_high, mean_x, mean_y, inv_std_x,
-                                                inv_std_y, updated, n, m, mainStart, otherStart, x, y);
+                                                inv_std_y, n, m, mainStart, otherStart, x, y);
 
         // Reset the tile local positions
         localY = 0;
@@ -510,9 +539,9 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
         thrust::device_ptr<unsigned long long int> ptr = thrust::device_pointer_cast(profile_merged[device]);
         thrust::transform(thrust::cuda::par.on(streams.at(device)), profile_dev[device], profile_dev[device] + n, profile_idx_dev[device], profile_merged[device], combiner);
         printf("Start main kernel on GPU %d\n", device);
-        cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
+        //cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
         cudaEventRecord(clocks_start[device], streams.at(device));
-        WavefrontUpdateSelfJoinMaxSharedMem<WORK_SIZE><<<dim3(ceil(num_workers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1), 0, streams.at(device)>>>(QT_dev[device], T_dev[device], stds[device], means[device], profile_merged[device], m, n, count, devices.size());
+        WavefrontUpdateSelfJoinMaxSharedMem<float, WORK_SIZE, AMT_UNROLL><<<dim3(ceil(num_workers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1), 0, streams.at(device)>>>(QT_dev[device], T_dev[device], stds[device], means[device], profile_merged[device], m, n, count, devices.size(), reg_mem<AMT_UNROLL>());
         cudaEventRecord(clocks_end[device], streams.at(device));
         ++count;
     }

@@ -24,6 +24,12 @@ typedef union  {
 } mp_entry;
 
 
+template<unsigned int count>
+struct reg_mem {
+    float dist[count];
+    double qt[count];
+};
+
 //For computing the prefix squared sum
 template<class DTYPE>
 struct square
