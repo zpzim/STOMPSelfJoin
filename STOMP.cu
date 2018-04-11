@@ -24,7 +24,13 @@ using std::unordered_map;
 using std::make_pair;
 
 static const unsigned int WORK_SIZE = 512;
+#if __CUDA_ARCH__ >= 700
+static const unsigned int AMT_UNROLL = 2;
+static const unsigned int TILE_HEIGHT_ADJUSTMENT = 4;
+#else
 static const unsigned int AMT_UNROLL = 16;
+static const unsigned int TILE_HEIGHT_ADJUSTMENT = 2;
+#endif
 
 //This macro checks return value of the CUDA runtime call and exits
 //the application if the call failed.
@@ -293,8 +299,7 @@ __global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const doub
     // we cannot do a full tile at once, we must chop it into pieces
     // The values that are set here should give good performance already
     // but may be fine tuned for your specific Nvidia architecture
-    const int factor = 2;
-    const int tile_height = BLOCKSZ / factor;
+    const int tile_height = BLOCKSZ / TILE_HEIGHT_ADJUSTMENT;
     const int tile_width = tile_height + BLOCKSZ;
     __shared__ mp_entry localMPMain[tile_width];
     __shared__ mp_entry localMPOther[tile_height];

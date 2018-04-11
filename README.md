@@ -2,8 +2,8 @@
 This is a GPU implementation of the STOMP algorithm. STOMP takes a time series as input and computes the matrix profile for a particular window size. You can read more at the [Matrix Profile Homepage](http://www.cs.ucr.edu/~eamonn/MatrixProfile.html)
 # Environment
 This base project requires:
- * At least version 8.0 of the CUDA toolkit available [here](https://developer.nvidia.com/cuda-toolkit).
- * An NVIDA GPU with CUDA support is also required. You can find a list of CUDA compatible GPUs [here](https://developer.nvidia.com/cuda-gpus)
+ * At least version 9.0 of the CUDA toolkit available [here](https://developer.nvidia.com/cuda-toolkit).
+ * An NVIDIA GPU with CUDA support is also required. You can find a list of CUDA compatible GPUs [here](https://developer.nvidia.com/cuda-gpus)
  * Currently builds under linux with the Makefile. 
  * Should compile under windows, but untested. 
 # Usage
