@@ -18,7 +18,8 @@ This base project requires:
 * By default, if no devices are specified, STOMP will run on all available devices
 
 
-# Matlab hook
+# Matlab hook (deprecated)
+ * The matlab hook is deprecated. It will be left here and is still mostly functional, but it will no longer be updated.
  * If you want to use these kernels in Matlab just run `make matlab`. This will output `STOMP.ptx`.
  * Just point Matlab to `STOMP.ptx` and `STOMP.cu` and you should be able to use any of the kernels through the [Matlab parallel computing toolbox](https://www.mathworks.com/products/parallel-computing.html).
  * StompSelfJoinGPU.m is a matlab script which will compute the matrix profile using the GPU. Assuming step 1 was followed.

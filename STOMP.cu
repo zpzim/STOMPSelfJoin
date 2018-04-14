@@ -291,7 +291,7 @@ __device__ inline void initialize_tile_memory(const unsigned long long int *prof
 
 //Computes the matrix profile given the sliding dot products for the first query and the precomputed data statisics
 template<class DTYPE, unsigned int BLOCKSZ, unsigned int UNROLL_COUNT>
-__global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const double* T, const double* inv_stds, const double* means, unsigned long long int* profile, unsigned int m, unsigned int n, int startPos, int numDevices, struct reg_mem<UNROLL_COUNT> mem)
+__global__ void WavefrontUpdateSelfJoin(const double* QT, const double* T, const double* inv_stds, const double* means, unsigned long long int* profile, unsigned int m, unsigned int n, int startPos, int numDevices)
 {
     // Factor and threads per block must both be powers of two where: factor <= threads per block
     // UNROLL_COUNT * factor must also evenly divide WORK_SIZE
@@ -312,6 +312,7 @@ __global__ void WavefrontUpdateSelfJoinMaxSharedMem(const double* QT, const doub
     __shared__ DTYPE B_high[tile_height];
     __shared__ DTYPE B_low[tile_height];
 
+    struct reg_mem<UNROLL_COUNT> mem;
     // This is the index of the meta-diagonal that this thread block will work on
     int meta_diagonal_idx = blockIdx.x * numDevices + startPos;
 
@@ -527,9 +528,8 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
         thrust::device_ptr<unsigned long long int> ptr = thrust::device_pointer_cast(profile_merged[device]);
         thrust::transform(thrust::cuda::par.on(streams.at(device)), profile_dev[device], profile_dev[device] + n, profile_idx_dev[device], profile_merged[device], combiner);
         printf("Start main kernel on GPU %d\n", device);
-        //cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
         cudaEventRecord(clocks_start[device], streams.at(device));
-        WavefrontUpdateSelfJoinMaxSharedMem<float, WORK_SIZE, AMT_UNROLL><<<dim3(ceil(num_workers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1), 0, streams.at(device)>>>(QT_dev[device], T_dev[device], stds[device], means[device], profile_merged[device], m, n, count, devices.size(), reg_mem<AMT_UNROLL>());
+        WavefrontUpdateSelfJoin<float, WORK_SIZE, AMT_UNROLL><<<dim3(ceil(num_workers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1), 0, streams.at(device)>>>(QT_dev[device], T_dev[device], stds[device], means[device], profile_merged[device], m, n, count, devices.size());
         cudaEventRecord(clocks_end[device], streams.at(device));
         ++count;
     }

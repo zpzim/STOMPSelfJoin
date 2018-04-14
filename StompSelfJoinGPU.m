@@ -41,7 +41,7 @@ lastz=zeros(MatrixProfileLength,1);
 
 subsequence = A(1:1+SubsequenceLength-1);
 subsequence = subsequence(end:-1:1);                                %Reverse the query
-subsequence(SubsequenceLength+1:2*length(A)) = 0;
+subsequence(SubsequenceLength+1:length(A)) = 0;
 
 Y = fft(subsequence);
 Z = X.*Y;
@@ -58,9 +58,9 @@ end
 %Do not modify the following 3 lines unless you know exactly what you are doing
 %the block size of 512 is a template parameter to the compiled kernel if you change this you
 %will need to modify and recompile the source
-k = parallel.gpu.CUDAKernel('STOMP.ptx', 'STOMP.cu', 'WavefrontUpdateSelfJoinMaxSharedMem');
+k = parallel.gpu.CUDAKernel('STOMP.ptx', 'STOMP.cu', 'WavefrontUpdateSelfJoin');
 k.ThreadBlockSize = [512 1 1];
-k.GridSize = [ceil(length(MatrixProfile)/512) 1 1];
+k.GridSize = [ceil(length(MatrixProfile)/ 512) 1 1];
 
 profile = gpuArray(ProfileAndIndex);
 MPindex(:) = 0;
@@ -72,17 +72,14 @@ means =gpuArray(meanx);
 stds = gpuArray(sigmax);
 t = tic();
 
-result = feval(k, QT, Ta, Ta, stds, means, profile, SubsequenceLength, MatrixProfileLength, 0, 1);
+result = feval(k, QT, Ta, stds, means, profile, SubsequenceLength, MatrixProfileLength, 0, 1);
 ProfileAndIndex = gather(result);
 gpuKernelTime = toc(t)
 for i = 1:length(MatrixProfile)
     item = typecast(ProfileAndIndex(i), 'uint64');
     itemMP = typecast(item, 'single');
     itemIdx = typecast(item, 'uint32');
-    MPindex(i) = itemIdx(2);
-    if i >1
-        MPindex(i) = MPindex(i) + 1;
-    end
+    MPindex(i) = itemIdx(2) + 1;
     MatrixProfile(i) = itemMP(1);
 end
 
@@ -91,7 +88,6 @@ MatrixProfile = sqrt(max(2 .* (SubsequenceLength - MatrixProfile), 0));
 % m is winSize
 function [X, n, sumx2, sumx, meanx, sigmax2, sigmax] = fastfindNNPre(x, m)
 n = length(x);
-x(n+1:2*n) = 0;
 X = fft(x);
 cum_sumx = cumsum(x);
 cum_sumx2 =  cumsum(x.^2);
