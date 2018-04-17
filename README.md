@@ -8,9 +8,11 @@ This base project requires:
  * Should compile under windows, but untested. 
 # Usage
 * Edit the Makefile
-  * Most GPU's should already be supported, but if needed set the value of ARCH to correspond to the compute capability of your GPU.
+  * Volta is supported by default, but if needed set the value of ARCH to correspond to the compute capability of your GPU.
     * "-gencode=arch=compute_code,code=sm_code" where code corresponds to the compute capability or arch you wish to add.
   * Make sure CUDA_DIRECTORY corresponds to the location where cuda is installed on your system. This is usually `/usr/local/cuda-(VERSION)/` on linux
+  * Also, by default the kernel parameters are optimized for volta only, if you are building for Pascal or earlier, please tune the variables TILE_HEIGHT_ADJUSTMENT and UNROLL_COUNT in STOMP.cu accordingly
+  * Some suggested parameters for different architectures are provided in the comments
 * `make`
 * `STOMP window_size input_file_path output_matrix_profile_path output_indexes_path (Optional: list of device numbers that you want to run on)`
 * Example:

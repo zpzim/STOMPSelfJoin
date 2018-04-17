@@ -24,13 +24,22 @@ using std::unordered_map;
 using std::make_pair;
 
 static const unsigned int WORK_SIZE = 512;
-#if __CUDA_ARCH__ >= 700
+
+// These parameters must be tuned for a specific architecture
+
+// By default they are tuned for Volta (V100)
 static const unsigned int AMT_UNROLL = 2;
 static const unsigned int TILE_HEIGHT_ADJUSTMENT = 4;
-#else
-static const unsigned int AMT_UNROLL = 16;
-static const unsigned int TILE_HEIGHT_ADJUSTMENT = 2;
-#endif
+
+//Pascal (P100)
+//static const unsigned int AMT_UNROLL = 16;
+//static const unsigned int TILE_HEIGHT_ADJUSTMENT = 2;
+
+// Kepler (K80/K40/K20)
+// on Kepler, these parameters do not affect the runtime as much because the bottleneck
+// is elsewhere
+//static const unsigned int AMT_UNROLL = 4;
+//static const unsigned int TILE_HEIGHT_ADJUSTMENT = 4;
 
 //This macro checks return value of the CUDA runtime call and exits
 //the application if the call failed.
@@ -546,7 +555,7 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
         printf("Device %d took %f seconds\n", device, time / 1000);
     }
 
-    printf("Finished STOMP to generate partial matrix profile of size %lu on %d devices:\n", n, devices.size());
+    printf("Finished STOMP to generate partial matrix profile of size %lu on %lu devices:\n", n, devices.size());
 
     // Free unneeded resources
     for (auto &device : devices) {

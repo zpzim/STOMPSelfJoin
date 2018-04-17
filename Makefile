@@ -1,7 +1,11 @@
 #Make sure that this points to the cuda install you want to use
 CUDA_DIRECTORY=/usr/local/cuda
 CC=$(CUDA_DIRECTORY)/bin/nvcc
-ARCH=-gencode=arch=compute_70,code=sm_70 -gencode=arch=compute_61,code=sm_61 -gencode=arch=compute_60,code=sm_60 -gencode=arch=compute_52,code=sm_52 -gencode=arch=compute_37,code=sm_37
+#Volta
+ARCH=-gencode=arch=compute_70,code=sm_70
+#Pascal
+#ARCH=-gencode=arch=compute_60,code=sm_60
+
 CFLAGS=-c -use_fast_math -lineinfo -O2 -std=c++11 $(ARCH) -I$(CUDA_DIRECTORY)/include
 
 #If you want to use the matlab hook, please specify the compute capability of your GPU below
