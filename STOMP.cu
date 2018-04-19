@@ -214,7 +214,7 @@ void sliding_dot_products_and_distance_profile(DTYPE* T, DTYPE* Q, DTYPE *QT, co
 
 //Atomically updates the MP/idxs using a single 64-bit integer. We lose a small amount of precision in the output, if we do not do this we are unable
 // to atomically update both the matrix profile and the indexes without using a critical section and dedicated locks.
-__device__ inline void MPatomicMax(volatile unsigned long long int* address, float val, unsigned int idx)
+__device__ inline void MPatomicMax(volatile unsigned long long int* __restrict__ address, float val, unsigned int idx)
 {
     mp_entry loc, loctest;
     loc.floats[0] = val;
@@ -226,13 +226,13 @@ __device__ inline void MPatomicMax(volatile unsigned long long int* address, flo
 }
 
 template<class DTYPE, unsigned int BLOCKSZ, unsigned int tile_height>
-__device__ inline void initialize_tile_memory(const unsigned long long int *profile, const double *T,
-                                              const double *means, const double *inv_stds,
-                                              volatile mp_entry localMPMain[], volatile mp_entry localMPOther[],
-                                              DTYPE A_low[], DTYPE A_high[], DTYPE B_low[], DTYPE B_high[],
-                                              DTYPE mean_x[], DTYPE mean_y[], DTYPE inv_std_x[],
-                                              DTYPE inv_std_y[], const unsigned int n, const unsigned int m,
-                                              const unsigned int mainStart, const unsigned int otherStart,
+__device__ inline void initialize_tile_memory(const unsigned long long int* __restrict__ profile, const double* __restrict__ T,
+                                              const double* __restrict__ means, const double* __restrict__ inv_stds,
+                                              volatile mp_entry* __restrict__ localMPMain, volatile mp_entry* __restrict__ localMPOther,
+                                              DTYPE* __restrict__ A_low, DTYPE* __restrict__ A_high, DTYPE* __restrict__ B_low,
+                                              DTYPE* __restrict__ B_high, DTYPE* __restrict__ mean_x, DTYPE* __restrict__ mean_y,
+                                              DTYPE* __restrict__ inv_std_x, DTYPE* __restrict__ inv_std_y, const unsigned int n,
+                                              const unsigned int m, const unsigned int mainStart, const unsigned int otherStart,
                                               const unsigned int x, const unsigned int y)
 {
     // Update local cache to point to the next chunk of the MP
@@ -300,7 +300,7 @@ __device__ inline void initialize_tile_memory(const unsigned long long int *prof
 
 //Computes the matrix profile given the sliding dot products for the first query and the precomputed data statisics
 template<class DTYPE, unsigned int BLOCKSZ, unsigned int UNROLL_COUNT>
-__global__ void WavefrontUpdateSelfJoin(const double* QT, const double* T, const double* inv_stds, const double* means, unsigned long long int* profile, unsigned int m, unsigned int n, int startPos, int numDevices)
+__global__ void WavefrontUpdateSelfJoin(const double* __restrict__ QT, const double* __restrict__ T, const double* __restrict__ inv_stds, const double* __restrict__ means, unsigned long long int* __restrict__ profile, unsigned int m, unsigned int n, int startPos, int numDevices)
 {
     // Factor and threads per block must both be powers of two where: factor <= threads per block
     // UNROLL_COUNT * factor must also evenly divide WORK_SIZE
