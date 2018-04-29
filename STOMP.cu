@@ -225,7 +225,7 @@ __device__ inline void MPatomicMax(volatile unsigned long long int* __restrict__
     }
 }
 
-template<class DTYPE, unsigned int BLOCKSZ, unsigned int tile_height>
+template<class DTYPE, unsigned int BLOCKSZ, unsigned int tile_height, unsigned int tile_width>
 __device__ inline void initialize_tile_memory(const unsigned long long int* __restrict__ profile, const double* __restrict__ T,
                                               const double* __restrict__ means, const double* __restrict__ inv_stds,
                                               volatile mp_entry* __restrict__ localMPMain, volatile mp_entry* __restrict__ localMPOther,
@@ -235,113 +235,226 @@ __device__ inline void initialize_tile_memory(const unsigned long long int* __re
                                               const unsigned int m, const unsigned int mainStart, const unsigned int otherStart,
                                               const unsigned int x, const unsigned int y)
 {
-    // Update local cache to point to the next chunk of the MP
-    // We may not get the 'freshest' values from the global array, but it doesn't really matter too much
-    if (mainStart + threadIdx.x < n) {
-        localMPMain[threadIdx.x].ulong = profile[mainStart + threadIdx.x];
-    } else {
-        localMPMain[threadIdx.x].floats[0] = CC_MIN;
-        localMPMain[threadIdx.x].ints[1] = 0;
+    int limit = n + m - 1;
+    int limit2 = n;
+    int global_position = mainStart  + threadIdx.x;
+    int local_position = threadIdx.x;
+    while(local_position < tile_width && global_position < limit) {
+        
+        A_low[local_position] = T[global_position];
+        if(global_position + m < limit) {
+            A_high[local_position] = T[global_position + m];
+        }
+        if(global_position < limit2) {
+            mean_x[local_position] = means[global_position] * m;
+            inv_std_x[local_position] = inv_stds[global_position];
+            localMPMain[local_position].ulong = profile[global_position];     
+        }
+        local_position += BLOCKSZ;
+        global_position += BLOCKSZ;
     }
 
-    // Each thread grabs 2 values for the main cache
-    if (threadIdx.x < tile_height && mainStart+threadIdx.x+BLOCKSZ < n) {
-        localMPMain[BLOCKSZ + threadIdx.x].ulong = profile[mainStart + BLOCKSZ + threadIdx.x];
-    } else if (threadIdx.x < tile_height) {
-        localMPMain[threadIdx.x + BLOCKSZ].floats[0] = CC_MIN;
-        localMPMain[threadIdx.x + BLOCKSZ].ints[1] = 0;
-    }
+    global_position = otherStart + threadIdx.x;
+    local_position = threadIdx.x;
+    while(local_position < tile_height && global_position < limit) {
+        B_low[local_position] = T[global_position];
+        if(global_position + m < limit) {
+            B_high[local_position] = T[global_position + m];
+        }
+        if(global_position < limit2) {
+            mean_y[local_position] = means[global_position];
+            inv_std_y[local_position] = inv_stds[global_position];
+            localMPOther[local_position].ulong = profile[global_position];
+        }
+        local_position += BLOCKSZ;
+        global_position += BLOCKSZ;
     
-    // We also update the cache for the transposed tile
-    if (threadIdx.x < tile_height && otherStart+threadIdx.x < n) {
-        localMPOther[threadIdx.x].ulong = profile[otherStart + threadIdx.x];
-    } else if (threadIdx.x < tile_height) {
-        localMPOther[threadIdx.x].floats[0] = CC_MIN;
-        localMPOther[threadIdx.x].ints[1] = 0;
     }
 
-    // Update the other cached values to reflect the upcoming tile
-    if (x <  n + m - 1) {
-        A_low[threadIdx.x] = T[x];
-    }
-    if (threadIdx.x < tile_height && x + BLOCKSZ < n + m - 1) {
-        A_low[threadIdx.x + BLOCKSZ] = T[x + BLOCKSZ];
-    }
-    
-    if (x + m < n + m - 1) {
-        A_high[threadIdx.x] = T[x + m];
-    }
-    if (threadIdx.x < tile_height && x + BLOCKSZ + m < n + m - 1) {
-        A_high[threadIdx.x + BLOCKSZ] = T[x + BLOCKSZ + m];
-    }
-    if (threadIdx.x < tile_height && y + threadIdx.x < n + m - 1) {
-        B_low[threadIdx.x] = T[y + threadIdx.x];
-    }
-    if (threadIdx.x < tile_height && y + threadIdx.x + m < n + m - 1) {
-        B_high[threadIdx.x] = T[y + threadIdx.x + m];
-    }
-    if (x < n) {
-        inv_std_x[threadIdx.x] = inv_stds[x];
-        // We precompute part of the distance calculation in the mean_x variable
-        // This saves us a multiply in the main loop
-        mean_x[threadIdx.x] = means[x] * m;
-    }
-    if (threadIdx.x < tile_height && x + BLOCKSZ < n) {
-        inv_std_x[threadIdx.x + BLOCKSZ] = inv_stds[x + BLOCKSZ];
-        // We precompute part of the distance calculation in the mean_x variable
-        // This saves us a multiply in the main loop
-        mean_x[threadIdx.x + BLOCKSZ] = means[x + BLOCKSZ] * m;
-    }
-    if (threadIdx.x < tile_height && y + threadIdx.x < n) {
-        inv_std_y[threadIdx.x] = inv_stds[y + threadIdx.x];
-        mean_y[threadIdx.x] = means[y + threadIdx.x];
-    }
 }
+
+
+__device__ inline void MPMax(const float d1, const float d2, const unsigned int i1, const unsigned int i2, float &outd, unsigned int &outi) {
+    if(d1 >= d2) {
+        outd = d1;
+        outi = i1;
+    } else {
+        outd = d2;
+        outi = i2;
+    }
+
+}
+
+// Processes an iteration of the inner loop. Each thread computes 4 distances per iteration (x,y), (x+1,y), (x+1,y+1), and (x+2,y+1)
+// This function assumes that the edge cases that occur on the edge of the distance matrix are not present. This is the faster path,
+// with less conditional branching.
+__device__ inline void do_iteration_unroll_2(int i, int j, int x, int y, int n, double &qt, double &qt2, float *A_low, float *A_high, float *B_low, float *B_high,
+			          float *mean_x, float *mean_y, float *inv_std_x, float *inv_std_y, mp_entry *localMPMain, mp_entry *localMPOther) 
+{
+            float meanx2,stdx2,ahigh2,alow2;
+            float dist_1,dist_2,dist_3;
+            unsigned int idx_1,idx_2,idx_3;
+            int t = i >> 1;
+            int k = j >> 1;
+	    // Preload the shared memory values we will use into registers
+	    // We load 2 values per instruction into a float2 vector type
+	    float2 blow = reinterpret_cast<float2*>(B_low)[t];
+	    float2 bhigh = reinterpret_cast<float2*>(B_high)[t];
+	    float2 meany = reinterpret_cast<float2*>(mean_y)[t];
+	    float2 stdy = reinterpret_cast<float2*>(inv_std_y)[t];
+            float2 ahigh = reinterpret_cast<float2*>(A_high)[k];
+	    float2 alow = reinterpret_cast<float2*>(A_low)[k];
+	    float2 stdx = reinterpret_cast<float2*>(inv_std_x)[k];
+	    float2 meanx = reinterpret_cast<float2*>(mean_x)[k];
+            meanx2 = mean_x[j + 2];
+	    stdx2 = inv_std_x[j + 2];
+	    ahigh2 = A_high[j + 2];
+            alow2 = A_low[j + 2];
+            float distx, disty, distz, distw;
+
+	    // Compute the next set of distances (row y)
+    	    distx = (static_cast<float>(qt) - (meanx.x * meany.x)) * stdx.x * stdy.x;
+            disty = (static_cast<float>(qt2) - (meanx.y * meany.x)) * stdx.y * stdy.x;
+
+	    // Update the matrix profile, see comment below for explanation
+	    MPatomicMax((unsigned long long*) (localMPMain + j), distx, y);
+            MPMax(distx, disty, x, x + 1, dist_1, idx_1);
+ 	    MPatomicMax((unsigned long long*) (localMPOther + i), dist_1, idx_1);	
+	
+	    // Update qt and compute the next distance values (row y + 1)
+	    qt = qt - alow.x * blow.x + ahigh.x * bhigh.x;
+            qt2 = qt2 - alow.y * blow.x + ahigh.y * bhigh.x;
+            distz = (static_cast<float>(qt) - (meanx.y * meany.y)) * stdx.y * stdy.y;
+            distw = (static_cast<float>(qt2) - (meanx2 * meany.y)) * stdx2 * stdy.y;
+	
+	    // There are 2 pairs of distances that share the same row and one 
+	    // pair of distances which share the same column
+	    // Including the previous updates, we need to perform 3 columnar
+            // updates and 2 row updates to the cached matrix profile per iteration
+            MPMax(disty, distz, y, y+1, dist_3, idx_3);
+            MPMax(distz,distw,x+1, x+2, dist_2, idx_2); 
+	    MPatomicMax((unsigned long long*) (localMPOther + i + 1), dist_2, idx_2);
+	    MPatomicMax((unsigned long long*) (localMPMain + j + 1), dist_3, idx_3);
+	    MPatomicMax((unsigned long long*) (localMPMain + j + 2), distw, y + 1);
+
+	    // Update qt values for the next iteration
+            qt = qt - alow.y * blow.y + ahigh.y * bhigh.y;
+            qt2 = qt2 - alow2 * blow.y + ahigh2 * bhigh.y;
+}
+
+// The function above, but now checks for edge cases
+__device__ void inline do_iteration_unroll_2_check(int i, int j, int x, int y, int n, double &qt, double &qt2, float *A_low, float *A_high, float *B_low, float *B_high,
+			          float *mean_x, float *mean_y, float *inv_std_x, float *inv_std_y, mp_entry *localMPMain, mp_entry *localMPOther) 
+   { 
+            float meanx2,stdx2,ahigh2,alow2;
+            int t = i >> 1;
+            int k = j >> 1;
+            // We may load some extra uninitialized values here,
+	    // But it doesn't matter as we won't use them to update
+            // the matrix profile
+	    float2 blow = reinterpret_cast<float2*>(B_low)[t];
+	    float2 bhigh = reinterpret_cast<float2*>(B_high)[t];
+	    float2 meany = reinterpret_cast<float2*>(mean_y)[t];
+	    float2 stdy = reinterpret_cast<float2*>(inv_std_y)[t];
+            float2 ahigh = reinterpret_cast<float2*>(A_high)[k];
+            float2 alow = reinterpret_cast<float2*>(A_low)[k];
+	    float2 stdx = reinterpret_cast<float2*>(inv_std_x)[k];
+	    float2 meanx = reinterpret_cast<float2*>(mean_x)[k];
+            if(x + 2 < n) {
+                meanx2 = mean_x[j + 2];
+		    stdx2 = inv_std_x[j + 2];
+		        ahigh2 = A_high[j + 2];
+                alow2 = A_low[j + 2];
+	        }
+            float distx, disty, distz, distw;
+    	    distx = (static_cast<float>(qt) - (meanx.x * meany.x)) * stdx.x * stdy.x;
+            disty = (static_cast<float>(qt2) - (meanx.y * meany.x)) * stdx.y * stdy.x;
+	    qt = qt - alow.x * blow.x + ahigh.x * bhigh.x;
+            qt2 = qt2 - alow.y * blow.x + ahigh.y * bhigh.x;
+            distz = (static_cast<float>(qt) - (meanx.y * meany.y)) * stdx.y * stdy.y;
+            distw = (static_cast<float>(qt2) - (meanx2 * meany.y)) * stdx2 * stdy.y;
+	        qt = qt - alow.y * blow.y + ahigh.y * bhigh.y;
+            qt2 = qt2 - alow2 * blow.y + ahigh2 * bhigh.y;
+            float dist_1,dist_2,dist_3;
+            unsigned int idx_1,idx_2,idx_3;
+		    MPatomicMax((unsigned long long*) (localMPMain + j), distx, y);
+            
+            if(x + 2 < n) {
+                MPMax(distx, disty, x, x + 1, dist_1, idx_1);
+		MPatomicMax((unsigned long long*) (localMPOther + i), dist_1, idx_1);	
+		if(y + 1 < n) {
+                	MPMax(disty, distz, y, y+1, dist_3, idx_3);
+                	MPMax(distz,distw,x+1, x+2, dist_2, idx_2); 
+			MPatomicMax((unsigned long long*) (localMPOther + i + 1), dist_2, idx_2);
+			MPatomicMax((unsigned long long*) (localMPMain + j + 1), dist_3, idx_3);
+			MPatomicMax((unsigned long long*) (localMPMain + j + 2), distw, y + 1);
+		} else {
+			MPatomicMax((unsigned long long*) (localMPMain + j + 1), disty, y);
+		}
+            } else if (x + 1 < n) {
+		
+                MPMax(distx, disty, x, x + 1, dist_1, idx_1);
+		MPatomicMax((unsigned long long*) (localMPOther + i), dist_1, idx_1);	
+                if( y + 1 < n) {	
+			MPMax(disty, distz, y, y+1, dist_3, idx_3);
+		        MPatomicMax((unsigned long long*) (localMPMain + j + 1), dist_3, idx_3);
+		        MPatomicMax((unsigned long long*) (localMPOther + i + 1), distz, x + 1);
+		} else {
+		        MPatomicMax((unsigned long long*) (localMPMain + j + 1), disty, y);
+		}
+            } else {
+		        MPatomicMax((unsigned long long*) (localMPOther + i + 1), distx, x);
+
+            }
+}
+
 
 //Computes the matrix profile given the sliding dot products for the first query and the precomputed data statisics
 template<class DTYPE, unsigned int BLOCKSZ, unsigned int UNROLL_COUNT>
-__global__ void WavefrontUpdateSelfJoin(const double* __restrict__ QT, const double* __restrict__ T, const double* __restrict__ inv_stds, const double* __restrict__ means, unsigned long long int* __restrict__ profile, unsigned int m, unsigned int n, int startPos, int numDevices)
+__global__ void __launch_bounds__(BLOCKSZ, 512 * 3 / BLOCKSZ) WavefrontUpdateSelfJoin(const double* __restrict__ QT, const double* __restrict__ T, const double* __restrict__ inv_stds, const double* __restrict__ means, unsigned long long int* __restrict__ profile, unsigned int m, unsigned int n, int startPos, int numDevices)
 {
-    // Factor and threads per block must both be powers of two where: factor <= threads per block
-    // UNROLL_COUNT * factor must also evenly divide WORK_SIZE
-    // 'factor' is a scaling factor for the tile size, due to shared memory considerations
-    // we cannot do a full tile at once, we must chop it into pieces
-    // The values that are set here should give good performance already
-    // but may be fine tuned for your specific Nvidia architecture
     const int tile_height = BLOCKSZ / TILE_HEIGHT_ADJUSTMENT;
-    const int tile_width = tile_height + BLOCKSZ;
+    const int tile_width = tile_height + BLOCKSZ * 2;
     __shared__ mp_entry localMPMain[tile_width];
     __shared__ mp_entry localMPOther[tile_height];
-    __shared__ DTYPE A_low[tile_width];
-    __shared__ DTYPE A_high[tile_width];
-    __shared__ DTYPE inv_std_x[tile_width];
-    __shared__ DTYPE inv_std_y[tile_height];
-    __shared__ DTYPE mean_x[tile_width];
-    __shared__ DTYPE mean_y[tile_height];
-    __shared__ DTYPE B_high[tile_height];
-    __shared__ DTYPE B_low[tile_height];
+    __shared__ float A_low[tile_width];
+    __shared__ float A_high[tile_width];
+    __shared__ float inv_std_x[tile_width];
+    __shared__ float inv_std_y[tile_height];
+    __shared__ float mean_x[tile_width];
+    __shared__ float mean_y[tile_height];
+    __shared__ float B_high[tile_height];
+    __shared__ float B_low[tile_height];
 
-    struct reg_mem<UNROLL_COUNT> mem;
     // This is the index of the meta-diagonal that this thread block will work on
     int meta_diagonal_idx = blockIdx.x * numDevices + startPos;
 
     // The first threads are acutally computing the trivial match between the same subsequence
     // we exclude these from the calculation
     const int exclusion = (m / 4);
-    int tile_start_x = meta_diagonal_idx * BLOCKSZ + exclusion;
+    int tile_start_x = meta_diagonal_idx * (BLOCKSZ * 2) + exclusion;
     int tile_start_y = 0;
     
     // x is the global column of the distance matrix
     // y is the global row of the distance matrix
     // localX, localY are the local coordinates of the thread position in the tile it is working on
-    int x = tile_start_x + threadIdx.x;
+    int x = tile_start_x + threadIdx.x * 2;
     int y = 0;
-    int localX, localY;
 
-    // Load the first dot product value
+    // Each thread updates 2 diagonals at once
+    double qt;
+    double qt2;
+    
+    // Load the first dot product values
     if (x < n) {
-        mem.qt[0] = QT[x];
+        qt = QT[x];
     }
+    
+    if (x + 1 < n) {
+	    qt2 = QT[x + 1];
+    }
+
+    
 
     /////////////////////////////////////    
     // Main loop
@@ -355,92 +468,49 @@ __global__ void WavefrontUpdateSelfJoin(const double* __restrict__ QT, const dou
     while (tile_start_x < n)
     {
         // Initialize the next tile's shared memory
-        initialize_tile_memory<DTYPE, BLOCKSZ, tile_height>(profile, T, means, inv_stds, localMPMain, localMPOther,
+        initialize_tile_memory<DTYPE, BLOCKSZ, tile_height, tile_width>(profile, T, means, inv_stds, localMPMain, localMPOther,
                                                 A_low, A_high, B_low, B_high, mean_x, mean_y, inv_std_x,
                                                 inv_std_y, n, m, tile_start_x, tile_start_y, x, y);
-
-        // Reset the tile local positions
-        localY = 0;
-        localX = threadIdx.x;
-
         // Start of new tile, sync
         __syncthreads();
 
 
-        // Process the tile:
-        // Each iteration generates the next UNROLL_COUNT distances
-        // This loop is partially unrolled to improve instruction level parallelism
-        // In all but the last tile in each metadiagonal, this first loop will compute
-        // the entire tile, at the end we will have some leftover (UNROLL_COUNT may
-        // not cleanly divide x) which is handled by the second loop
-        while (x < n - UNROLL_COUNT + 1 && localY < tile_height)
-        {
-            // Update the QT value for the next iteration(s)
-            #pragma unroll
-            for (int i = 0; i < UNROLL_COUNT - 1; ++i) {
-                mem.qt[i + 1] = mem.qt[i] - A_low[localX + i] * B_low[localY + i] + A_high[localX + i] * B_high[localY + i];
-            }
-            
-            // Compute the next partial distance value(s):
-            // We defer some of the calculation until after the kernel has finished, this saves us several
-            // long latency math operations in this critical path.
-            // The distance computed here can be converted to the true z-normalized euclidan
-            // distance in constant time
-            // mean_x has already been multiplied with the window size 'm' when the tile was populated
-            // This saves us an extra multiply for each distance computed
-            #pragma unroll
-            for (int i = 0; i < UNROLL_COUNT; ++i) {
-                mem.dist[i] = (static_cast<float>(mem.qt[i]) - (mean_x[localX + i] * mean_y[localY + i])) * inv_std_x[localX + i] * inv_std_y[localY + i];
-            }
 
-            // This is the next qt value that will be used in the next iteration of the loop
-            mem.qt[0] = mem.qt[UNROLL_COUNT - 1] - A_low[localX + UNROLL_COUNT - 1] * B_low[localY + UNROLL_COUNT - 1] + A_high[localX + UNROLL_COUNT - 1] * B_high[localY + UNROLL_COUNT - 1];
-
-            // Update the cache with the new max value atomically
-            // This is a major source of latency, but this is probably still the best option
-            // if you can think of a better way to handle this please let me know
-            #pragma unroll
-            for (int i = 0; i < UNROLL_COUNT; ++i) {
-                MPatomicMax((unsigned long long*) (localMPMain + localX + i), mem.dist[i], y + i);
-                MPatomicMax((unsigned long long*) (localMPOther + localY + i), mem.dist[i], x + i);
-            }
-
-            x += UNROLL_COUNT;
-            y += UNROLL_COUNT;
-            localX += UNROLL_COUNT;
-            localY += UNROLL_COUNT;
-        }
-        double qt_curr = mem.qt[0];
-
+	// There are 2 pathways here, most of the time we take the fast path (top), at the very end of the kernel we take the slower path (bottom)
+	if(x + tile_height < n) {
+		for(int i = 0, j = threadIdx.x * 2; i < tile_height; i+=2, j+=2) {
+			do_iteration_unroll_2(i,j,x + i,y + i,n, qt,qt2, A_low, A_high, B_low, B_high, mean_x, mean_y, inv_std_x, inv_std_y,localMPMain, localMPOther);
+		}
+		x += tile_height;
+		y += tile_height;
+	}else {
+	    int localX = threadIdx.x * 2;
+	    int localY = 0;
+	    while(x < n) {
+            	do_iteration_unroll_2_check(localY,localX,x,y,n,qt,qt2,A_low, A_high, B_low, B_high, mean_x, mean_y, inv_std_x, inv_std_y, localMPMain, localMPOther); 
+		x += 2;
+		y += 2;
+		localX += 2;
+		localY += 2;
+	    }
+	}
         
-        // Finish the remaining iterations of the final tile if there were leftover
-        // NOTE: this loop should only execute once for each thread beacuse we restrict
-        // UNROLL_COUNT to be a factor of tile_height
-        while (x < n && localY < tile_height) {
-            float dist = (static_cast<float>(qt_curr) - (mean_x[localX] * mean_y[localY])) * inv_std_x[localX] * inv_std_y[localY];
-            qt_curr = qt_curr - A_low[localX] * B_low[localY] + A_high[localX] * B_high[localY];
-            MPatomicMax((unsigned long long*) (localMPMain + localX), dist, y);
-            MPatomicMax((unsigned long long*) (localMPOther + localY), dist, x);
-            x++;
-            y++;
-            localX++;
-            localY++;
-        }
-
-        // After this sync, the caches will be updated with the best so far values for this tile
+	// After this sync, the caches will be updated with the best so far values for this tile
         __syncthreads();
 
         // If we updated any values in the cached MP, try to push them to the global "master" MP
         if (tile_start_x + threadIdx.x < n) {
         	MPatomicMax(profile + tile_start_x + threadIdx.x, localMPMain[threadIdx.x].floats[0], localMPMain[threadIdx.x].ints[1]);
         }
-        if (tile_start_x + threadIdx.x + BLOCKSZ < n && threadIdx.x < tile_height) {
+        if (tile_start_x + threadIdx.x + BLOCKSZ < n) {
         	MPatomicMax(profile + BLOCKSZ + tile_start_x + threadIdx.x, localMPMain[threadIdx.x + BLOCKSZ].floats[0], localMPMain[threadIdx.x + BLOCKSZ].ints[1]);
+        }
+        if (tile_start_x + threadIdx.x + BLOCKSZ * 2 < n && threadIdx.x < tile_height) {
+        	MPatomicMax(profile + BLOCKSZ * 2 + tile_start_x + threadIdx.x, localMPMain[threadIdx.x + BLOCKSZ * 2].floats[0], localMPMain[threadIdx.x + BLOCKSZ * 2].ints[1]);
         }
         if (tile_start_y + threadIdx.x < n && threadIdx.x < tile_height) {
         	MPatomicMax(profile + tile_start_y + threadIdx.x, localMPOther[threadIdx.x].floats[0], localMPOther[threadIdx.x].ints[1]);
         }
-
         // Update the tile position
         tile_start_x += tile_height;
         tile_start_y += tile_height;
@@ -517,7 +587,7 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
     }
 
     MPIDXCombine combiner;
-    int num_workers = ceil((n - m / 4) / (float) devices.size());
+    int num_workers = ceil(ceil((n - (m / 4)) / (float) devices.size()) / 2.0);
     
     // Asynchronously copy relevant data, precompute statistics, generate partial matrix profile
     int count = 0;
@@ -536,7 +606,10 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
         
         thrust::device_ptr<unsigned long long int> ptr = thrust::device_pointer_cast(profile_merged[device]);
         thrust::transform(thrust::cuda::par.on(streams.at(device)), profile_dev[device], profile_dev[device] + n, profile_idx_dev[device], profile_merged[device], combiner);
+        cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
+        gpuErrchk(cudaPeekAtLastError());
         printf("Start main kernel on GPU %d\n", device);
+
         cudaEventRecord(clocks_start[device], streams.at(device));
         WavefrontUpdateSelfJoin<float, WORK_SIZE, AMT_UNROLL><<<dim3(ceil(num_workers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1), 0, streams.at(device)>>>(QT_dev[device], T_dev[device], stds[device], means[device], profile_merged[device], m, n, count, devices.size());
         cudaEventRecord(clocks_end[device], streams.at(device));
