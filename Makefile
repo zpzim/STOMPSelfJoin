@@ -2,7 +2,7 @@
 CUDA_DIRECTORY=/usr/local/cuda
 CC=$(CUDA_DIRECTORY)/bin/nvcc
 #Volta
-ARCH=-gencode=arch=compute_70,code=sm_70
+ARCH=-gencode=arch=compute_60,code=sm_70
 #Pascal
 #ARCH=-gencode=arch=compute_60,code=sm_60
 
