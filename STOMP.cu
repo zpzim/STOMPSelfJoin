@@ -85,14 +85,38 @@ __global__ void sliding_std(DTYPE* cumsumsqr, unsigned int window, unsigned int 
 }
 
 template<class DTYPE>
-void compute_statistics(const DTYPE *T, DTYPE *means, DTYPE *stds, size_t n, size_t m, cudaStream_t s)
+__global__ void sliding_norm(DTYPE* cumsumsqr, unsigned int window, unsigned int size, DTYPE* norms) {
+    const DTYPE coeff = 1 / (DTYPE) window;
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    int b = blockIdx.x * blockDim.x + threadIdx.x + window;
+    if (a == 0) {
+        norms[a] = 1 / sqrt(cumsumsqr[window - 1]);
+    }
+    else if (b < size + window) {
+        norms[a] = 1 / sqrt(cumsumsqr[b - 1] - cumsumsqr[a - 1]);
+    }
+}
+
+template<class DTYPE>
+__global__ void sliding_dfdg(const DTYPE *T, const DTYPE *means, DTYPE *df, DTYPE *dg, const int m, const int n) {
+    const DTYPE inv_m = 1.0 / (DTYPE) m;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if(tid < n - 1) {
+        df[tid] = (T[tid + m] - T[tid]) * inv_m;
+        dg[tid] = (T[tid + m] - means[tid + 1]) + (T[tid] - means[tid]);
+    }
+}
+
+
+template<class DTYPE>
+void compute_statistics(const DTYPE *T, DTYPE *norms, DTYPE *df, DTYPE *dg, DTYPE *means, size_t n, size_t m, cudaStream_t s)
 {
     square<DTYPE> sqr;
     dim3 grid(ceil(n / (double) WORK_SIZE), 1,1);
     dim3 block(WORK_SIZE, 1, 1);
     
     DTYPE *scratch;
-    cudaMalloc(&scratch, sizeof(DTYPE) * n);
+    cudaMalloc(&scratch, sizeof(DTYPE) * (n + m - 1));
     gpuErrchk(cudaPeekAtLastError());
     
     thrust::device_ptr<const DTYPE> dev_ptr_T = thrust::device_pointer_cast(T);
@@ -104,11 +128,13 @@ void compute_statistics(const DTYPE *T, DTYPE *means, DTYPE *stds, size_t n, siz
     // Use prefix sum to compute sliding mean
     sliding_mean<DTYPE><<<grid, block, 0, s>>>(scratch, m, n, means);
     gpuErrchk(cudaPeekAtLastError());
+
+    sliding_dfdg<DTYPE><<<grid, block, 0, s>>>(T, means, df,dg,m,n);
     // Compute prefix sum of squares in scratch
     thrust::transform_inclusive_scan(thrust::cuda::par.on(s), dev_ptr_T, dev_ptr_T + n + m - 1, dev_ptr_scratch, sqr,thrust::plus<DTYPE>());
     gpuErrchk(cudaPeekAtLastError());
     // Use prefix sum of squares to compute the sliding standard deviation
-    sliding_std<DTYPE><<<grid, block, 0, s>>>(scratch, m, n, means, stds);
+    sliding_norm<DTYPE><<<grid, block, 0, s>>>(scratch, m, n, norms);
     gpuErrchk(cudaPeekAtLastError());
     cudaStreamSynchronize(s);
     gpuErrchk(cudaPeekAtLastError());
@@ -143,23 +169,23 @@ __global__ void normalized_aligned_dot_products(const DTYPE* A, const DTYPE divi
 {
     int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a < n) {
-        QT[a] = A[a + m - 1] / divisor;
+        QT[a] = A[a + m - 1];
     }
 }
 
 template<class DTYPE>
-__global__ void populate_reverse_pad(const DTYPE *Q, DTYPE *Q_reverse_pad, const int window_size, const int size)
+__global__ void populate_reverse_pad(const DTYPE *Q, const DTYPE *means, DTYPE *Q_reverse_pad, const int window_size, const int size)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if(tid < window_size) {
-        Q_reverse_pad[tid] = Q[window_size - 1 - tid];
+        Q_reverse_pad[tid] = Q[window_size - 1 - tid] - means[window_size - 1 - tid];
     }else if(tid < size){ 
         Q_reverse_pad[tid] = 0;
     }
 }
 
 template<class DTYPE, class CUFFT_DTYPE>
-void sliding_dot_products_and_distance_profile(DTYPE* T, DTYPE* Q, DTYPE *QT, const int size, const int window_len, cudaStream_t s)
+void sliding_dot_products_and_distance_profile(DTYPE* T, DTYPE* Q, DTYPE *QT, DTYPE *means, const int size, const int window_len, cudaStream_t s)
 {        
 
     const int n = size - window_len + 1;
@@ -183,7 +209,7 @@ void sliding_dot_products_and_distance_profile(DTYPE* T, DTYPE* Q, DTYPE *QT, co
     gpuErrchk(cudaPeekAtLastError());
 
     // Reverse and zero pad the query
-    populate_reverse_pad<DTYPE><<<dim3(ceil(size / (float) WORK_SIZE),1,1), block, 0, s>>>(Q, Q_reverse_pad, window_len, size);
+    populate_reverse_pad<DTYPE><<<dim3(ceil(size / (float) WORK_SIZE),1,1), block, 0, s>>>(Q, means, Q_reverse_pad, window_len, size);
     gpuErrchk(cudaPeekAtLastError());
     
     // Compute the FFT of the query
@@ -226,46 +252,31 @@ __device__ inline void MPatomicMax(volatile unsigned long long int* __restrict__
 }
 
 template<class DTYPE, unsigned int BLOCKSZ, unsigned int tile_height, unsigned int tile_width>
-__device__ inline void initialize_tile_memory(const unsigned long long int* __restrict__ profile, const double* __restrict__ T,
-                                              const double* __restrict__ means, const double* __restrict__ inv_stds,
-                                              volatile mp_entry* __restrict__ localMPMain, volatile mp_entry* __restrict__ localMPOther,
-                                              DTYPE* __restrict__ A_low, DTYPE* __restrict__ A_high, DTYPE* __restrict__ B_low,
-                                              DTYPE* __restrict__ B_high, DTYPE* __restrict__ mean_x, DTYPE* __restrict__ mean_y,
-                                              DTYPE* __restrict__ inv_std_x, DTYPE* __restrict__ inv_std_y, const unsigned int n,
-                                              const unsigned int m, const unsigned int mainStart, const unsigned int otherStart,
-                                              const unsigned int x, const unsigned int y)
+__device__  void initialize_tile_memory(const unsigned long long int* __restrict__ profile, const double* __restrict__ df,
+                                              const double* __restrict__ dg, const double* __restrict__ norms,
+                                              mp_entry* __restrict__ local_mp_col, mp_entry* __restrict__ local_mp_row,
+                                              DTYPE* __restrict__ df_col, DTYPE* __restrict__ df_row, DTYPE* __restrict__ dg_col,
+                                              DTYPE* __restrict__ dg_row, DTYPE* __restrict__ norm_col, DTYPE* __restrict__ norm_row,
+                                              const unsigned int n, const unsigned int col_start, const unsigned int row_start)
 {
-    int limit = n + m - 1;
-    int limit2 = n;
-    int global_position = mainStart  + threadIdx.x;
+    int global_position = col_start + threadIdx.x;
     int local_position = threadIdx.x;
-    while(local_position < tile_width && global_position < limit) {
-        
-        A_low[local_position] = T[global_position];
-        if(global_position + m < limit) {
-            A_high[local_position] = T[global_position + m];
-        }
-        if(global_position < limit2) {
-            mean_x[local_position] = means[global_position] * m;
-            inv_std_x[local_position] = inv_stds[global_position];
-            localMPMain[local_position].ulong = profile[global_position];     
-        }
+    while(local_position < tile_width && global_position < n) {
+        dg_col[local_position] = dg[global_position];
+        df_col[local_position] = df[global_position];
+        norm_col[local_position] = norms[global_position];
+        local_mp_col[local_position].ulong = profile[global_position];
         local_position += BLOCKSZ;
         global_position += BLOCKSZ;
     }
 
-    global_position = otherStart + threadIdx.x;
+    global_position = row_start + threadIdx.x;
     local_position = threadIdx.x;
-    while(local_position < tile_height && global_position < limit) {
-        B_low[local_position] = T[global_position];
-        if(global_position + m < limit) {
-            B_high[local_position] = T[global_position + m];
-        }
-        if(global_position < limit2) {
-            mean_y[local_position] = means[global_position];
-            inv_std_y[local_position] = inv_stds[global_position];
-            localMPOther[local_position].ulong = profile[global_position];
-        }
+    while(local_position < tile_height && global_position < n) {
+        dg_row[local_position] = dg[global_position];
+        df_row[local_position] = df[global_position];
+        norm_row[local_position] = norms[global_position];
+        local_mp_row[local_position].ulong = profile[global_position];
         local_position += BLOCKSZ;
         global_position += BLOCKSZ;
     
@@ -288,64 +299,64 @@ __device__ inline void MPMax(const float d1, const float d2, const unsigned int 
 // Processes an iteration of the inner loop. Each thread computes 4 distances per iteration (x,y), (x+1,y), (x+1,y+1), and (x+2,y+1)
 // This function assumes that the edge cases that occur on the edge of the distance matrix are not present. This is the faster path,
 // with less conditional branching.
-__device__ inline void do_iteration_unroll_2(int i, int j, int x, int y, int n, double &qt, double &qt2, float *A_low, float *A_high, float *B_low, float *B_high,
-			          float *mean_x, float *mean_y, float *inv_std_x, float *inv_std_y, mp_entry *localMPMain, mp_entry *localMPOther) 
+__device__ inline void do_iteration_unroll_2(int i, int j, int x, int y, int n, double &cov, double &cov2,
+                                             float *df_col, float *df_row, float *dg_col, float *dg_row,
+                                             float *inorm_col, float *inorm_row, mp_entry *local_mp_col,
+                                              mp_entry *local_mp_row) 
 {
-            float meanx2,stdx2,ahigh2,alow2;
-            float dist_1,dist_2,dist_3;
-            unsigned int idx_1,idx_2,idx_3;
-            int t = i >> 1;
-            int k = j >> 1;
-	    // Preload the shared memory values we will use into registers
-	    // We load 2 values per instruction into a float2 vector type
-	    float2 blow = reinterpret_cast<float2*>(B_low)[t];
-	    float2 bhigh = reinterpret_cast<float2*>(B_high)[t];
-	    float2 meany = reinterpret_cast<float2*>(mean_y)[t];
-	    float2 stdy = reinterpret_cast<float2*>(inv_std_y)[t];
-            float2 ahigh = reinterpret_cast<float2*>(A_high)[k];
-	    float2 alow = reinterpret_cast<float2*>(A_low)[k];
-	    float2 stdx = reinterpret_cast<float2*>(inv_std_x)[k];
-	    float2 meanx = reinterpret_cast<float2*>(mean_x)[k];
-            meanx2 = mean_x[j + 2];
-	    stdx2 = inv_std_x[j + 2];
-	    ahigh2 = A_high[j + 2];
-            alow2 = A_low[j + 2];
-            float distx, disty, distz, distw;
+    float dist_1,dist_2,dist_3;
+    unsigned int idx_1,idx_2,idx_3;
+    int r = i >> 1;
+    int c = j >> 1;
+    // Preload the shared memory values we will use into registers
+    // We load 2 values per instruction into a float2 vector type
+    float2 dfc = reinterpret_cast<float2*>(df_col)[c];
+    float2 dgc = reinterpret_cast<float2*>(dg_col)[c];
+    float2 inormc = reinterpret_cast<float2*>(inorm_col)[c];
+    float2 dgr = reinterpret_cast<float2*>(dg_row)[r];
+    float2 dfr = reinterpret_cast<float2*>(df_row)[r];
+    float2 inormr = reinterpret_cast<float2*>(inorm_row)[r];
+    
+    float dfcz = df_col[j + 2];
+    float dgcz = dg_col[j + 2];
+    float inormcz = inorm_col[j + 2];
+    float distx, disty, distz, distw;
 
-	    // Compute the next set of distances (row y)
-    	    distx = (static_cast<float>(qt) - (meanx.x * meany.x)) * stdx.x * stdy.x;
-            disty = (static_cast<float>(qt2) - (meanx.y * meany.x)) * stdx.y * stdy.x;
+    // Compute the next set of distances (row y)
+    distx = static_cast<float>(cov) * inormc.x * inormr.x;
+    disty = static_cast<float>(cov2) * inormc.y * inormr.x;
 
-	    // Update the matrix profile, see comment below for explanation
-	    MPatomicMax((unsigned long long*) (localMPMain + j), distx, y);
-            MPMax(distx, disty, x, x + 1, dist_1, idx_1);
- 	    MPatomicMax((unsigned long long*) (localMPOther + i), dist_1, idx_1);	
-	
-	    // Update qt and compute the next distance values (row y + 1)
-	    qt = qt - alow.x * blow.x + ahigh.x * bhigh.x;
-            qt2 = qt2 - alow.y * blow.x + ahigh.y * bhigh.x;
-            distz = (static_cast<float>(qt) - (meanx.y * meany.y)) * stdx.y * stdy.y;
-            distw = (static_cast<float>(qt2) - (meanx2 * meany.y)) * stdx2 * stdy.y;
-	
-	    // There are 2 pairs of distances that share the same row and one 
-	    // pair of distances which share the same column
-	    // Including the previous updates, we need to perform 3 columnar
-            // updates and 2 row updates to the cached matrix profile per iteration
-            MPMax(disty, distz, y, y+1, dist_3, idx_3);
-            MPMax(distz,distw,x+1, x+2, dist_2, idx_2); 
-	    MPatomicMax((unsigned long long*) (localMPOther + i + 1), dist_2, idx_2);
-	    MPatomicMax((unsigned long long*) (localMPMain + j + 1), dist_3, idx_3);
-	    MPatomicMax((unsigned long long*) (localMPMain + j + 2), distw, y + 1);
+    // Update the matrix profile, see comment below for explanation
+    MPatomicMax((unsigned long long*) (local_mp_col + j), distx, y);
+    MPMax(distx, disty, x, x + 1, dist_1, idx_1);
+    MPatomicMax((unsigned long long*) (local_mp_row + i), dist_1, idx_1);	
 
-	    // Update qt values for the next iteration
-            qt = qt - alow.y * blow.y + ahigh.y * bhigh.y;
-            qt2 = qt2 - alow2 * blow.y + ahigh2 * bhigh.y;
+    // Update cov and compute the next distance values (row y + 1)
+    cov = cov - dfc.x * dgr.x + dgc.x * dfr.x;
+    cov2 = cov2 - dfc.y * dgr.x + dgc.y * dfr.x;
+
+    distz = static_cast<float>(cov) * inormc.y * inormr.y;
+    distw = static_cast<float>(cov2) * inormcz * inormr.y; 
+
+    // There are 2 pairs of distances that share the same row and one 
+    // pair of distances which share the same column
+    // Including the previous updates, we need to perform 3 columnar
+    // updates and 2 row updates to the cached matrix profile per iteration
+    MPMax(disty, distz, y, y+1, dist_3, idx_3);
+    MPMax(distz,distw,x+1, x+2, dist_2, idx_2); 
+    MPatomicMax((unsigned long long*) (local_mp_row + i + 1), dist_2, idx_2);
+    MPatomicMax((unsigned long long*) (local_mp_col + j + 1), dist_3, idx_3);
+    MPatomicMax((unsigned long long*) (local_mp_col + j + 2), distw, y + 1);
+
+    // Update cov values for the next iteration
+    cov = cov - dfc.y * dgr.y + dgc.y * dfr.y;
+    cov2 = cov2 - dfcz * dgr.y + dgcz * dfr.y;
 }
 
 // The function above, but now checks for edge cases
 __device__ void inline do_iteration_unroll_2_check(int i, int j, int x, int y, int n, double &qt, double &qt2, float *A_low, float *A_high, float *B_low, float *B_high,
 			          float *mean_x, float *mean_y, float *inv_std_x, float *inv_std_y, mp_entry *localMPMain, mp_entry *localMPOther) 
-   { 
+{ 
             float meanx2,stdx2,ahigh2,alow2;
             int t = i >> 1;
             int k = j >> 1;
@@ -411,20 +422,22 @@ __device__ void inline do_iteration_unroll_2_check(int i, int j, int x, int y, i
 
 //Computes the matrix profile given the sliding dot products for the first query and the precomputed data statisics
 template<class DTYPE, unsigned int BLOCKSZ, unsigned int UNROLL_COUNT>
-__global__ void __launch_bounds__(BLOCKSZ, 512 * 3 / BLOCKSZ) WavefrontUpdateSelfJoin(const double* __restrict__ QT, const double* __restrict__ T, const double* __restrict__ inv_stds, const double* __restrict__ means, unsigned long long int* __restrict__ profile, unsigned int m, unsigned int n, int startPos, int numDevices)
+__global__ void __launch_bounds__(BLOCKSZ, 2048  / BLOCKSZ)
+WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict__ df,
+                        const double* __restrict__ dg, const double* __restrict__ norms,
+                        unsigned long long* __restrict__ profile, const unsigned int m,
+                        const unsigned int n, int startPos, int numDevices)
 {
     const int tile_height = BLOCKSZ / TILE_HEIGHT_ADJUSTMENT;
     const int tile_width = tile_height + BLOCKSZ * 2;
-    __shared__ mp_entry localMPMain[tile_width];
-    __shared__ mp_entry localMPOther[tile_height];
-    __shared__ float A_low[tile_width];
-    __shared__ float A_high[tile_width];
-    __shared__ float inv_std_x[tile_width];
-    __shared__ float inv_std_y[tile_height];
-    __shared__ float mean_x[tile_width];
-    __shared__ float mean_y[tile_height];
-    __shared__ float B_high[tile_height];
-    __shared__ float B_low[tile_height];
+    __shared__ mp_entry local_mp_col[tile_width];
+    __shared__ mp_entry local_mp_row[tile_height];
+    __shared__ float df_col[tile_width];
+    __shared__ float dg_col[tile_width];
+    __shared__ float inorm_col[tile_width];
+    __shared__ float df_row[tile_height];
+    __shared__ float dg_row[tile_height];
+    __shared__ float inorm_row[tile_height];
 
     // This is the index of the meta-diagonal that this thread block will work on
     int meta_diagonal_idx = blockIdx.x * numDevices + startPos;
@@ -442,16 +455,23 @@ __global__ void __launch_bounds__(BLOCKSZ, 512 * 3 / BLOCKSZ) WavefrontUpdateSel
     int y = 0;
 
     // Each thread updates 2 diagonals at once
-    double qt;
-    double qt2;
+    double cov1, cov2, cov3, cov4;
     
     // Load the first dot product values
     if (x < n) {
-        qt = QT[x];
+        cov1 = Cov[x];
     }
     
     if (x + 1 < n) {
-	    qt2 = QT[x + 1];
+	    cov2 = Cov[x + 1];
+    }
+    
+    if (x + 2 < n) {
+	    cov3 = Cov[x + 2];
+    }
+
+    if(x + 3 < n) {
+        cov4 = Cov[x + 3]; 
     }
 
     
@@ -468,48 +488,47 @@ __global__ void __launch_bounds__(BLOCKSZ, 512 * 3 / BLOCKSZ) WavefrontUpdateSel
     while (tile_start_x < n)
     {
         // Initialize the next tile's shared memory
-        initialize_tile_memory<DTYPE, BLOCKSZ, tile_height, tile_width>(profile, T, means, inv_stds, localMPMain, localMPOther,
-                                                A_low, A_high, B_low, B_high, mean_x, mean_y, inv_std_x,
-                                                inv_std_y, n, m, tile_start_x, tile_start_y, x, y);
+        initialize_tile_memory<DTYPE, BLOCKSZ, tile_height, tile_width>(profile, df, dg, norms, local_mp_col, local_mp_row,
+                                                                        df_col, df_row, dg_col, dg_row, inorm_col, inorm_row,
+                                                                        n, tile_start_x, tile_start_y);
         // Start of new tile, sync
         __syncthreads();
 
-
-
-	// There are 2 pathways here, most of the time we take the fast path (top), at the very end of the kernel we take the slower path (bottom)
-	if(x + tile_height < n) {
-		for(int i = 0, j = threadIdx.x * 2; i < tile_height; i+=2, j+=2) {
-			do_iteration_unroll_2(i,j,x + i,y + i,n, qt,qt2, A_low, A_high, B_low, B_high, mean_x, mean_y, inv_std_x, inv_std_y,localMPMain, localMPOther);
-		}
-		x += tile_height;
-		y += tile_height;
-	}else {
-	    int localX = threadIdx.x * 2;
-	    int localY = 0;
-	    while(x < n) {
-            	do_iteration_unroll_2_check(localY,localX,x,y,n,qt,qt2,A_low, A_high, B_low, B_high, mean_x, mean_y, inv_std_x, inv_std_y, localMPMain, localMPOther); 
-		x += 2;
-		y += 2;
-		localX += 2;
-		localY += 2;
+        // There are 2 pathways here, most of the time we take the fast path (top), at the very end of the kernel we take the slower path (bottom)
+        if(x + tile_height < n) {
+            for(int i = 0, j = threadIdx.x * 2; i < tile_height; i+=2, j+=2) {
+                do_iteration_unroll_2(i,j,x + i,y + i,n, cov1,cov2, df_col, df_row, dg_col, dg_row, inorm_col, inorm_row, local_mp_col, local_mp_row);
+            }
+		    x += tile_height;
+            y += tile_height;
+        } else {
+            int localX = threadIdx.x * 2;
+            int localY = 0;
+            while(x + 2 < n && y + 1 < n) {
+                do_iteration_unroll_2(localY,localX,x +localY,y + localY,n, cov1,cov2, df_col, df_row, dg_col, dg_row, inorm_col, inorm_row, local_mp_col, local_mp_row);
+                //do_iteration_unroll_2_check(localY,localX,x,y,n,qt,qt2,A_low, A_high, B_low, B_high, mean_x, mean_y, inv_std_x, inv_std_y, localMPMain, localMPOther); 
+                x += 2;
+                y += 2;
+                localX += 2;
+                localY += 2;
+            }
 	    }
-	}
         
-	// After this sync, the caches will be updated with the best so far values for this tile
+        // After this sync, the caches will be updated with the best so far values for this tile
         __syncthreads();
 
         // If we updated any values in the cached MP, try to push them to the global "master" MP
         if (tile_start_x + threadIdx.x < n) {
-        	MPatomicMax(profile + tile_start_x + threadIdx.x, localMPMain[threadIdx.x].floats[0], localMPMain[threadIdx.x].ints[1]);
+        	MPatomicMax(profile + tile_start_x + threadIdx.x, local_mp_col[threadIdx.x].floats[0], local_mp_col[threadIdx.x].ints[1]);
         }
         if (tile_start_x + threadIdx.x + BLOCKSZ < n) {
-        	MPatomicMax(profile + BLOCKSZ + tile_start_x + threadIdx.x, localMPMain[threadIdx.x + BLOCKSZ].floats[0], localMPMain[threadIdx.x + BLOCKSZ].ints[1]);
+        	MPatomicMax(profile + BLOCKSZ + tile_start_x + threadIdx.x, local_mp_col[threadIdx.x + BLOCKSZ].floats[0], local_mp_col[threadIdx.x + BLOCKSZ].ints[1]);
         }
         if (tile_start_x + threadIdx.x + BLOCKSZ * 2 < n && threadIdx.x < tile_height) {
-        	MPatomicMax(profile + BLOCKSZ * 2 + tile_start_x + threadIdx.x, localMPMain[threadIdx.x + BLOCKSZ * 2].floats[0], localMPMain[threadIdx.x + BLOCKSZ * 2].ints[1]);
+        	MPatomicMax(profile + BLOCKSZ * 2 + tile_start_x + threadIdx.x, local_mp_col[threadIdx.x + BLOCKSZ * 2].floats[0], local_mp_col[threadIdx.x + BLOCKSZ * 2].ints[1]);
         }
         if (tile_start_y + threadIdx.x < n && threadIdx.x < tile_height) {
-        	MPatomicMax(profile + tile_start_y + threadIdx.x, localMPOther[threadIdx.x].floats[0], localMPOther[threadIdx.x].ints[1]);
+        	MPatomicMax(profile + tile_start_y + threadIdx.x, local_mp_row[threadIdx.x].floats[0], local_mp_row[threadIdx.x].ints[1]);
         }
         // Update the tile position
         tile_start_x += tile_height;
@@ -539,7 +558,7 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
     
     size_t n = T_h.size() - m + 1;
     
-    unordered_map<int, DTYPE*> T_dev, QT_dev, means, stds;
+    unordered_map<int, DTYPE*> T_dev, QT_dev, means, norms, df, dg;
     unordered_map<int, float*> profile_dev;
     unordered_map<int, unsigned long long int*> profile_merged;
     unordered_map<int, unsigned int*> profile_idx_dev;
@@ -553,7 +572,9 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
         T_dev.insert(make_pair(device, (DTYPE*) 0));
         QT_dev.insert(make_pair(device, (DTYPE*) 0));
         means.insert(make_pair(device, (DTYPE*) 0));
-        stds.insert(make_pair(device, (DTYPE*) 0));
+        norms.insert(make_pair(device, (DTYPE*) 0));
+        df.insert(make_pair(device, (DTYPE*) 0));
+        dg.insert(make_pair(device, (DTYPE*) 0));
         profile_dev.insert(make_pair(device,(float*) NULL));
         profile_merged.insert(make_pair(device,(unsigned long long int*) NULL));
         profile_idx_dev.insert(make_pair(device,(unsigned int *) NULL));
@@ -569,7 +590,11 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
         gpuErrchk(cudaPeekAtLastError());
         cudaMalloc(&means.at(device), sizeof(DTYPE) * profile_h.size());
         gpuErrchk(cudaPeekAtLastError());
-        cudaMalloc(&stds.at(device), sizeof(DTYPE) * profile_h.size());
+        cudaMalloc(&norms.at(device), sizeof(DTYPE) * profile_h.size());
+        gpuErrchk(cudaPeekAtLastError());
+        cudaMalloc(&df.at(device), sizeof(DTYPE) * profile_h.size());
+        gpuErrchk(cudaPeekAtLastError());
+        cudaMalloc(&dg.at(device), sizeof(DTYPE) * profile_h.size());
         gpuErrchk(cudaPeekAtLastError());
         cudaMalloc(&profile_merged.at(device), sizeof(unsigned long long int) * n);
         gpuErrchk(cudaPeekAtLastError());
@@ -601,8 +626,8 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
         gpuErrchk(cudaPeekAtLastError());
 
         // Computing the statistics for each device is overkill, but it avoids needing to do some staging on the host if P2P transfer doesn't work
-        compute_statistics<DTYPE>(T_dev[device], means[device], stds[device], n, m, streams.at(device));
-        sliding_dot_products_and_distance_profile<DTYPE, CUFFT_DTYPE>(T_dev[device], T_dev[device], QT_dev[device], T_h.size(), m, streams.at(device));
+        compute_statistics<DTYPE>(T_dev[device], norms[device], df[device], dg[device], means[device], n, m, streams.at(device));
+        sliding_dot_products_and_distance_profile<DTYPE, CUFFT_DTYPE>(T_dev[device], T_dev[device], means[device], QT_dev[device], T_h.size(), m, streams.at(device));
         
         thrust::device_ptr<unsigned long long int> ptr = thrust::device_pointer_cast(profile_merged[device]);
         thrust::transform(thrust::cuda::par.on(streams.at(device)), profile_dev[device], profile_dev[device] + n, profile_idx_dev[device], profile_merged[device], combiner);
@@ -611,7 +636,7 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
         printf("Start main kernel on GPU %d\n", device);
 
         cudaEventRecord(clocks_start[device], streams.at(device));
-        WavefrontUpdateSelfJoin<float, WORK_SIZE, AMT_UNROLL><<<dim3(ceil(num_workers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1), 0, streams.at(device)>>>(QT_dev[device], T_dev[device], stds[device], means[device], profile_merged[device], m, n, count, devices.size());
+        WavefrontUpdateSelfJoin<float, WORK_SIZE, AMT_UNROLL><<<dim3(ceil(num_workers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1), 0, streams.at(device)>>>(QT_dev[device], df[device], dg[device], norms[device], profile_merged[device], m, n, count, devices.size());
         cudaEventRecord(clocks_end[device], streams.at(device));
         ++count;
     }
@@ -647,7 +672,7 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
         gpuErrchk(cudaPeekAtLastError());
         cudaFree(means[device]);
         gpuErrchk(cudaPeekAtLastError());
-        cudaFree(stds[device]);
+        cudaFree(norms[device]);
         gpuErrchk(cudaPeekAtLastError());
         cudaStreamDestroy(streams.at(device));
         gpuErrchk(cudaPeekAtLastError());
@@ -686,7 +711,7 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
     gpuErrchk(cudaPeekAtLastError());
          
     // Compute the final distance calculation to convert cross correlation computed earlier into euclidean distance
-    cross_correlation_to_ed<<<dim3(ceil(n / (float) WORK_SIZE), 1, 1), dim3(WORK_SIZE, 1, 1)>>>(profile_dev[devices.at(0)], n, m); 
+    //cross_correlation_to_ed<<<dim3(ceil(n / (float) WORK_SIZE), 1, 1), dim3(WORK_SIZE, 1, 1)>>>(profile_dev[devices.at(0)], n, m); 
     gpuErrchk(cudaPeekAtLastError());
     cudaMemcpy(profile_idx_h.data(), profile_idx_dev[devices.at(0)], sizeof(unsigned int) * n, cudaMemcpyDeviceToHost);
     gpuErrchk(cudaPeekAtLastError());
