@@ -29,7 +29,7 @@ static const unsigned int WORK_SIZE = 512;
 
 // By default they are tuned for Volta (V100)
 static const unsigned int AMT_UNROLL = 2;
-static const unsigned int TILE_HEIGHT_ADJUSTMENT = 4;
+static const unsigned int TILE_HEIGHT_ADJUSTMENT = 2;
 
 //Pascal (P100)
 //static const unsigned int AMT_UNROLL = 16;
@@ -99,17 +99,33 @@ __global__ void sliding_norm(DTYPE* cumsumsqr, unsigned int window, unsigned int
 
 template<class DTYPE>
 __global__ void sliding_dfdg(const DTYPE *T, const DTYPE *means, DTYPE *df, DTYPE *dg, const int m, const int n) {
-    const DTYPE inv_m = 1.0 / (DTYPE) m;
+    const DTYPE half = 1.0 / (DTYPE) 2.0;
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if(tid < n - 1) {
-        df[tid] = (T[tid + m] - T[tid]) * inv_m;
+        df[tid] = (T[tid + m] - T[tid]) * half;
         dg[tid] = (T[tid + m] - means[tid + 1]) + (T[tid] - means[tid]);
+    }
+}
+
+template<class DTYPE>
+void fastinvnorm(vector<DTYPE> &norm, const vector<DTYPE> &mean, const vector<DTYPE> &T, int m) {
+    
+    DTYPE sum = 0;
+    for(int i = 0; i < m; ++i){ 
+        sum += pow(T[i] - mean[0],2);
+    }
+    norm[0] =  sum;
+    for(int i = 1; i < norm.size(); ++i) {
+            norm[i] = norm[i - 1]  + ((T[i-1] - mean[i-1]) + (T[i + m - 1] - mean[i])) * (T[i + m - 1] - T[i - 1]);
+    }
+    for(int i = 0; i < norm.size(); ++i) {
+        norm[i] = 1.0 / sqrt(norm[i]);
     }
 }
 
 
 template<class DTYPE>
-void compute_statistics(const DTYPE *T, DTYPE *norms, DTYPE *df, DTYPE *dg, DTYPE *means, size_t n, size_t m, cudaStream_t s)
+void compute_statistics(const vector<DTYPE> &T_h, const DTYPE *T, DTYPE *norms, DTYPE *df, DTYPE *dg, DTYPE *means, size_t n, size_t m, cudaStream_t s)
 {
     square<DTYPE> sqr;
     dim3 grid(ceil(n / (double) WORK_SIZE), 1,1);
@@ -134,7 +150,15 @@ void compute_statistics(const DTYPE *T, DTYPE *norms, DTYPE *df, DTYPE *dg, DTYP
     thrust::transform_inclusive_scan(thrust::cuda::par.on(s), dev_ptr_T, dev_ptr_T + n + m - 1, dev_ptr_scratch, sqr,thrust::plus<DTYPE>());
     gpuErrchk(cudaPeekAtLastError());
     // Use prefix sum of squares to compute the sliding standard deviation
-    sliding_norm<DTYPE><<<grid, block, 0, s>>>(scratch, m, n, norms);
+    vector<DTYPE> norm(n, 0);
+    vector<DTYPE> mean(n);
+    cudaMemcpy(mean.data(), means, n * sizeof(DTYPE), cudaMemcpyDeviceToHost);
+    gpuErrchk(cudaPeekAtLastError());
+    fastinvnorm(norm, mean, T_h, m);
+//    for(int i = 0; i < n; ++i) {
+//        printf("%d norm = %.10lf\n", i, norm.at(i));
+//    }
+    cudaMemcpy(norms, norm.data(), n * sizeof(DTYPE), cudaMemcpyHostToDevice);
     gpuErrchk(cudaPeekAtLastError());
     cudaStreamSynchronize(s);
     gpuErrchk(cudaPeekAtLastError());
@@ -169,7 +193,7 @@ __global__ void normalized_aligned_dot_products(const DTYPE* A, const DTYPE divi
 {
     int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a < n) {
-        QT[a] = A[a + m - 1];
+        QT[a] = A[a + m - 1] / divisor;
     }
 }
 
@@ -178,7 +202,7 @@ __global__ void populate_reverse_pad(const DTYPE *Q, const DTYPE *means, DTYPE *
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if(tid < window_size) {
-        Q_reverse_pad[tid] = Q[window_size - 1 - tid] - means[window_size - 1 - tid];
+        Q_reverse_pad[tid] = Q[window_size - 1 - tid] - means[0];
     }else if(tid < size){ 
         Q_reverse_pad[tid] = 0;
     }
@@ -203,7 +227,6 @@ void sliding_dot_products_and_distance_profile(DTYPE* T, DTYPE* Q, DTYPE *QT, DT
     cudaMalloc(&Q_reverse_pad, sizeof(DTYPE) * size);
     cudaMalloc(&Tc, sizeof(CUFFT_DTYPE) * cufft_data_size);
     cudaMalloc(&Qc, sizeof(CUFFT_DTYPE) * cufft_data_size);
-    
     // Compute the FFT of the time series
     CUFFT_FORWARD__(fft_plan, T, Tc);
     gpuErrchk(cudaPeekAtLastError());
@@ -226,7 +249,14 @@ void sliding_dot_products_and_distance_profile(DTYPE* T, DTYPE* Q, DTYPE *QT, DT
     
     normalized_aligned_dot_products<DTYPE><<<grid, block, 0, s>>>(Q_reverse_pad, size, window_len, n, QT);
     gpuErrchk(cudaPeekAtLastError());
-    
+
+    vector<DTYPE> temp(n);
+    cudaMemcpy(temp.data(), QT, n * sizeof(DTYPE), cudaMemcpyDeviceToHost);
+/*
+    for(int i = 0; i < n; ++i) {
+        printf("%d cov = %lf\n", i, temp.at(i)); 
+    }
+*/
     cudaFree(Q_reverse_pad);
     cudaFree(Tc);
     cudaFree(Qc);
@@ -321,7 +351,7 @@ __device__ inline void do_iteration_unroll_2(int i, int j, int x, int y, int n, 
     float dgcz = dg_col[j + 2];
     float inormcz = inorm_col[j + 2];
     float distx, disty, distz, distw;
-
+    
     // Compute the next set of distances (row y)
     distx = static_cast<float>(cov) * inormc.x * inormr.x;
     disty = static_cast<float>(cov2) * inormc.y * inormr.x;
@@ -330,6 +360,10 @@ __device__ inline void do_iteration_unroll_2(int i, int j, int x, int y, int n, 
     MPatomicMax((unsigned long long*) (local_mp_col + j), distx, y);
     MPMax(distx, disty, x, x + 1, dist_1, idx_1);
     MPatomicMax((unsigned long long*) (local_mp_row + i), dist_1, idx_1);	
+
+    if(threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("x = %d, y = %d, cov = %lf, dfc = %f dgr = %f, dgc = %f, dfr = %f\n", x, y, cov, dfc.x, dgr.x, dgc.x, dfr.x);
+    }
 
     // Update cov and compute the next distance values (row y + 1)
     cov = cov - dfc.x * dgr.x + dgc.x * dfr.x;
@@ -347,6 +381,10 @@ __device__ inline void do_iteration_unroll_2(int i, int j, int x, int y, int n, 
     MPatomicMax((unsigned long long*) (local_mp_row + i + 1), dist_2, idx_2);
     MPatomicMax((unsigned long long*) (local_mp_col + j + 1), dist_3, idx_3);
     MPatomicMax((unsigned long long*) (local_mp_col + j + 2), distw, y + 1);
+    
+    if(threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("x = %d, y = %d, cov = %lf, dfc = %f dgr = %f, dgc = %f, dfr = %f\n", x + 1, y + 1, cov, dfc.y, dgr.y, dgc.y, dfr.y);
+    }
 
     // Update cov values for the next iteration
     cov = cov - dfc.y * dgr.y + dgc.y * dfr.y;
@@ -422,7 +460,7 @@ __device__ void inline do_iteration_unroll_2_check(int i, int j, int x, int y, i
 
 //Computes the matrix profile given the sliding dot products for the first query and the precomputed data statisics
 template<class DTYPE, unsigned int BLOCKSZ, unsigned int UNROLL_COUNT>
-__global__ void __launch_bounds__(BLOCKSZ, 2048  / BLOCKSZ)
+__global__ void __launch_bounds__(BLOCKSZ, 512 * 3  / BLOCKSZ)
 WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict__ df,
                         const double* __restrict__ dg, const double* __restrict__ norms,
                         unsigned long long* __restrict__ profile, const unsigned int m,
@@ -544,7 +582,7 @@ WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict
 __global__ void cross_correlation_to_ed(float *profile, unsigned int n, unsigned int m) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if(tid < n) {
-        profile[tid] = sqrt(max(2*(m - profile[tid]), 0.0));
+        profile[tid] = sqrt(max(2*(1 - profile[tid]), 0.0));
     }
 }
 
@@ -626,9 +664,22 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
         gpuErrchk(cudaPeekAtLastError());
 
         // Computing the statistics for each device is overkill, but it avoids needing to do some staging on the host if P2P transfer doesn't work
-        compute_statistics<DTYPE>(T_dev[device], norms[device], df[device], dg[device], means[device], n, m, streams.at(device));
-        sliding_dot_products_and_distance_profile<DTYPE, CUFFT_DTYPE>(T_dev[device], T_dev[device], means[device], QT_dev[device], T_h.size(), m, streams.at(device));
-        
+        compute_statistics<DTYPE>(T_h, T_dev[device], norms[device], df[device], dg[device], means[device], n, m, streams.at(device));
+/*        
+        vector<double> tdf(n), tdg(n);
+        cudaMemcpy(tdf.data(), df[device], n * sizeof(DTYPE), cudaMemcpyDeviceToHost);
+        gpuErrchk(cudaPeekAtLastError());
+        cudaMemcpy(tdg.data(), dg[device], n * sizeof(DTYPE), cudaMemcpyDeviceToHost);
+        gpuErrchk(cudaPeekAtLastError());
+        cudaDeviceSynchronize();
+        gpuErrchk(cudaPeekAtLastError());
+        for(int i = 0; i < n; ++i){
+            printf("%d = [%lf,%lf]\n",i, tdf.at(i), tdg.at(i));
+        }
+        exit(0); 
+*/
+        sliding_dot_products_and_distance_profile<DTYPE, CUFFT_DTYPE>(T_dev[device], T_dev[device], QT_dev[device], means[device], T_h.size(), m, streams.at(device));
+         
         thrust::device_ptr<unsigned long long int> ptr = thrust::device_pointer_cast(profile_merged[device]);
         thrust::transform(thrust::cuda::par.on(streams.at(device)), profile_dev[device], profile_dev[device] + n, profile_idx_dev[device], profile_merged[device], combiner);
         cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
@@ -711,7 +762,7 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
     gpuErrchk(cudaPeekAtLastError());
          
     // Compute the final distance calculation to convert cross correlation computed earlier into euclidean distance
-    //cross_correlation_to_ed<<<dim3(ceil(n / (float) WORK_SIZE), 1, 1), dim3(WORK_SIZE, 1, 1)>>>(profile_dev[devices.at(0)], n, m); 
+    cross_correlation_to_ed<<<dim3(ceil(n / (float) WORK_SIZE), 1, 1), dim3(WORK_SIZE, 1, 1)>>>(profile_dev[devices.at(0)], n, m); 
     gpuErrchk(cudaPeekAtLastError());
     cudaMemcpy(profile_idx_h.data(), profile_idx_dev[devices.at(0)], sizeof(unsigned int) * n, cudaMemcpyDeviceToHost);
     gpuErrchk(cudaPeekAtLastError());

@@ -6,7 +6,7 @@ ARCH=-gencode=arch=compute_60,code=sm_60
 #Pascal
 #ARCH=-gencode=arch=compute_60,code=sm_60
 
-CFLAGS=-c -use_fast_math -lineinfo -O2 -std=c++11 $(ARCH) -I$(CUDA_DIRECTORY)/include
+CFLAGS=-c --ptxas-options="-v" -use_fast_math -lineinfo -O2 -std=c++11 $(ARCH) -I$(CUDA_DIRECTORY)/include
 
 #If you want to use the matlab hook, please specify the compute capability of your GPU below
 MATLABARCH=-gencode=arch=compute_60,code=sm_60
