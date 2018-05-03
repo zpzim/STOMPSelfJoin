@@ -155,9 +155,6 @@ void compute_statistics(const vector<DTYPE> &T_h, const DTYPE *T, DTYPE *norms, 
     cudaMemcpy(mean.data(), means, n * sizeof(DTYPE), cudaMemcpyDeviceToHost);
     gpuErrchk(cudaPeekAtLastError());
     fastinvnorm(norm, mean, T_h, m);
-//    for(int i = 0; i < n; ++i) {
-//        printf("%d norm = %.10lf\n", i, norm.at(i));
-//    }
     cudaMemcpy(norms, norm.data(), n * sizeof(DTYPE), cudaMemcpyHostToDevice);
     gpuErrchk(cudaPeekAtLastError());
     cudaStreamSynchronize(s);
@@ -252,11 +249,6 @@ void sliding_dot_products_and_distance_profile(DTYPE* T, DTYPE* Q, DTYPE *QT, DT
 
     vector<DTYPE> temp(n);
     cudaMemcpy(temp.data(), QT, n * sizeof(DTYPE), cudaMemcpyDeviceToHost);
-/*
-    for(int i = 0; i < n; ++i) {
-        printf("%d cov = %lf\n", i, temp.at(i)); 
-    }
-*/
     cudaFree(Q_reverse_pad);
     cudaFree(Tc);
     cudaFree(Qc);
@@ -361,13 +353,9 @@ __device__ inline void do_iteration_unroll_2(int i, int j, int x, int y, int n, 
     MPMax(distx, disty, x, x + 1, dist_1, idx_1);
     MPatomicMax((unsigned long long*) (local_mp_row + i), dist_1, idx_1);	
 
-    if(threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("x = %d, y = %d, cov = %lf, dfc = %f dgr = %f, dgc = %f, dfr = %f\n", x, y, cov, dfc.x, dgr.x, dgc.x, dfr.x);
-    }
-
     // Update cov and compute the next distance values (row y + 1)
-    cov = cov - dfc.x * dgr.x + dgc.x * dfr.x;
-    cov2 = cov2 - dfc.y * dgr.x + dgc.y * dfr.x;
+    cov = cov + dfc.x * dgr.x + dgc.x * dfr.x;
+    cov2 = cov2 + dfc.y * dgr.x + dgc.y * dfr.x;
 
     distz = static_cast<float>(cov) * inormc.y * inormr.y;
     distw = static_cast<float>(cov2) * inormcz * inormr.y; 
@@ -382,13 +370,9 @@ __device__ inline void do_iteration_unroll_2(int i, int j, int x, int y, int n, 
     MPatomicMax((unsigned long long*) (local_mp_col + j + 1), dist_3, idx_3);
     MPatomicMax((unsigned long long*) (local_mp_col + j + 2), distw, y + 1);
     
-    if(threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("x = %d, y = %d, cov = %lf, dfc = %f dgr = %f, dgc = %f, dfr = %f\n", x + 1, y + 1, cov, dfc.y, dgr.y, dgc.y, dfr.y);
-    }
-
     // Update cov values for the next iteration
-    cov = cov - dfc.y * dgr.y + dgc.y * dfr.y;
-    cov2 = cov2 - dfcz * dgr.y + dgcz * dfr.y;
+    cov = cov + dfc.y * dgr.y + dgc.y * dfr.y;
+    cov2 = cov2 + dfcz * dgr.y + dgcz * dfr.y;
 }
 
 // The function above, but now checks for edge cases
@@ -512,7 +496,7 @@ WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict
         cov4 = Cov[x + 3]; 
     }
 
-    
+    //double invm = 1.0 / (double) m; 
 
     /////////////////////////////////////    
     // Main loop
@@ -582,7 +566,7 @@ WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict
 __global__ void cross_correlation_to_ed(float *profile, unsigned int n, unsigned int m) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if(tid < n) {
-        profile[tid] = sqrt(max(2*(1 - profile[tid]), 0.0));
+        profile[tid] = sqrt(max(2*(1 - profile[tid]), 0.0)) * sqrt((double)m);
     }
 }
 
