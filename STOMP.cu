@@ -320,6 +320,29 @@ __device__ inline void MPMax(const float d1, const float d2, const unsigned int 
 
 }
 
+__device__ inline void MPMax2(float &d1, const float &d2, unsigned int &i1,
+                             const unsigned int &i2)
+{
+    if(d2 > d1) {
+        d1 = d2;
+        i1 = i2;
+    } 
+}
+
+__device__ inline float max4(const float4 &d) {
+    float ret = d.x;
+    if(d.y > ret) {
+        ret = d.y;
+    }
+    if(d.z > ret) {
+        ret = d.z;
+    }
+    if(d.w > ret) {
+        ret = d.w;
+    }
+    return ret;
+}
+
 // Processes an iteration of the inner loop. Each thread computes 4 distances per iteration (x,y), (x+1,y), (x+1,y+1), and (x+2,y+1)
 // This function assumes that the edge cases that occur on the edge of the distance matrix are not present. This is the faster path,
 // with less conditional branching.
@@ -377,6 +400,93 @@ __device__ inline void do_iteration_unroll_2(int i, int j, int x, int y, int n, 
 }
 
 
+__device__ inline void do_unrolled_row4(double &cov1, double &cov2, double &cov3, double &cov4,
+                                         float &distcol1, float &distcol2, float &distcol3,
+                                         float &distcol4, unsigned int &idxcol1,
+                                         unsigned int &idxcol2, unsigned int &idxcol3, unsigned int &idxcol4,
+                                         const float &inormcx, const float &inormcy, const float &inormcz,
+                                         const float &inormcw, const float &inormr,
+                                         const float &df_colx, const float &df_coly, const float &df_colz,
+                                         const float &df_colw, const float &dg_colx, const float &dg_coly,
+                                         const float &dg_colz, const float &dg_colw, const float &df_row,
+                                         const float &dg_row, const int &row, const int &col,
+                                         mp_entry* __restrict__ mp_row) {
+    float4 dist;
+    dist.x = static_cast<float>(cov1) * inormcx * inormr;
+    dist.y = static_cast<float>(cov2) * inormcy * inormr;
+    dist.z = static_cast<float>(cov3) * inormcz * inormr;
+    dist.w = static_cast<float>(cov4) * inormcw * inormr;
+    // Update cov and compute the next distance values (row y)
+    cov1 = cov1 + df_colx * dg_row + dg_colx * df_row;
+    cov2 = cov2 + df_coly * dg_row + dg_coly * df_row;
+    cov3 = cov3 + df_colz * dg_row + dg_colz * df_row;
+    cov4 = cov4 + df_colw * dg_row + dg_colw * df_row;
+    MPMax2(distcol1, dist.x, idxcol1, col);
+    MPMax2(distcol2, dist.y, idxcol2, col + 1);
+    MPMax2(distcol3, dist.z, idxcol3, col + 2);
+    MPMax2(distcol4, dist.w, idxcol4, col + 3);
+    MPatomicMax((unsigned long long*) (mp_row + row), max4(dist), row);
+}
+
+// Processes an iteration of the inner loop. Each thread computes 4 distances per iteration (x,y), (x+1,y), (x+1,y+1), and (x+2,y+1)
+// This function assumes that the edge cases that occur on the edge of the distance matrix are not present. This is the faster path,
+// with less conditional branching.
+__device__ inline void do_iteration_unroll_4(int i, int j, int x, int y, int n, double &cov1, double &cov2, double &cov3, double& cov4,
+                                             float* __restrict__ df_col, float* __restrict__ df_row, float* __restrict__ dg_col,
+                                             float* __restrict__ dg_row, float* __restrict__ inorm_col, float* __restrict__ inorm_row,
+                                             mp_entry* __restrict__ local_mp_col, mp_entry* __restrict__ local_mp_row) 
+{
+    float4 distc = make_float4(CC_MIN, CC_MIN, CC_MIN, CC_MIN);
+    float4 distc2 = make_float4(CC_MIN, CC_MIN, CC_MIN, CC_MIN);
+    uint4 idxc,idxc2;
+    int r = i >> 1;
+    int c = j >> 2;
+    // Preload the shared memory values we will use into registers
+    // We load 2 values per instruction into a float2 vector type
+    float4 dfc = reinterpret_cast<float4*>(df_col)[c];
+    float4 dgc = reinterpret_cast<float4*>(dg_col)[c];
+    float4 inormc = (reinterpret_cast<float4*>(inorm_col)[c]);
+    float4 dfc2 = reinterpret_cast<float4*>(df_col)[c+1];
+    float4 dgc2 = reinterpret_cast<float4*>(dg_col)[c+1];
+    float4 inormc2 = reinterpret_cast<float4*>(inorm_col)[c+1];
+    float2 dgr = reinterpret_cast<float2*>(dg_row)[r];
+    float2 dfr = reinterpret_cast<float2*>(df_row)[r];
+    float2 inormr = reinterpret_cast<float2*>(inorm_row)[r];
+
+    do_unrolled_row4(cov1, cov2, cov3, cov4, distc.x, distc.y, distc.z, distc.w,
+                     idxc.x, idxc.y, idxc.z, idxc.w, inormc.x, inormc.y, inormc.z, inormc.w,
+                     inormr.x, dfc.x, dfc.y, dfc.z, dfc.w, dgc.x, dgc.y, dgc.z, dgc.w, dfr.x, dgr.x, i, j, local_mp_row);
+
+    MPatomicMax((unsigned long long*) (local_mp_col + j), distc.x, idxc.x);
+
+    do_unrolled_row4(cov1, cov2, cov3, cov4, distc.y, distc.z, distc.w, distc2.x,
+                     idxc.y, idxc.z, idxc.w, idxc2.x, inormc.y, inormc.z, inormc.w, inormc2.x,
+                     inormr.y, dfc.y, dfc.z, dfc.w, dfc2.x, dgc.y, dgc.z, dgc.w, dgc2.x, dfr.y, dgr.y, i + 1, j + 1, local_mp_row);
+
+    MPatomicMax((unsigned long long*) (local_mp_col + j + 1), distc.y, idxc.y);
+
+    dgr = reinterpret_cast<float2*>(dg_row)[r + 1];
+    dfr = reinterpret_cast<float2*>(df_row)[r + 1];
+    inormr = reinterpret_cast<float2*>(inorm_row)[r + 1];
+
+    do_unrolled_row4(cov1, cov2, cov3, cov4, distc.z, distc.w, distc2.x, distc2.y,
+                     idxc.z, idxc.w, idxc2.x, idxc2.y, inormc.z, inormc.w, inormc2.x, inormc2.y,
+                     inormr.x, dfc.z, dfc.w, dfc2.x, dfc2.y, dgc.z, dgc.w, dgc2.x, dgc2.y, dfr.x, dgr.x, i + 2, j + 2, local_mp_row);
+
+    MPatomicMax((unsigned long long*) (local_mp_col + j + 2), distc.z, idxc.z);
+
+    do_unrolled_row4(cov1, cov2, cov3, cov4, distc.w, distc2.x, distc2.y, distc2.z,
+                     idxc.w, idxc2.x, idxc2.y, idxc2.z, inormc.w, inormc2.x, inormc2.y, inormc2.z,
+                     inormr.y, dfc.w, dfc2.x, dfc2.y, dfc2.z, dgc.w, dgc2.x, dgc2.y, dgc2.z, dfr.y, dgr.y, i + 3, j + 3, local_mp_row);
+
+    MPatomicMax((unsigned long long*) (local_mp_col + j + 3), distc.w, idxc.w);
+    MPatomicMax((unsigned long long*) (local_mp_col + j + 4), distc2.x, idxc2.x);
+    MPatomicMax((unsigned long long*) (local_mp_col + j + 5), distc2.y, idxc2.y);
+    MPatomicMax((unsigned long long*) (local_mp_col + j + 6), distc2.z, idxc2.z);
+    
+}
+
+
 // Does a single iteration of the inner loop on 2 diagonals, not unrolled
 // Checks for the boundary case where only 1 diagonal can be updated
 __device__ inline void do_iteration(int i, int j, int x, int y, int n, double &cov, double &cov2,
@@ -404,17 +514,57 @@ __device__ inline void do_iteration(int i, int j, int x, int y, int n, double &c
     }
 }
 
+// Does a single iteration of the inner loop on 4 diagonals per thread, not unrolled
+// Checks for the boundary case where only 1, 2, or 3 diagonals can be updated
+__device__ inline void do_iteration_4diag(int i, int j, int x, int y, int n, double &cov1, double &cov2,
+                                          double &cov3, double &cov4, float *df_col, float *df_row,
+                                          float *dg_col, float *dg_row, float *inorm_col, float *inorm_row,
+                                          mp_entry *local_mp_col, mp_entry *local_mp_row) 
+{
+    float dist_1;
+    unsigned int idx_1;
+    float4 dist;
+    // Compute the next set of distances (row y)
+    dist.x = static_cast<float>(cov1) * inorm_col[j] * inorm_row[i];
+    dist.y = static_cast<float>(cov2) * inorm_col[j + 1] * inorm_row[i];
+    dist.z = static_cast<float>(cov3) * inorm_col[j + 2] * inorm_row[i];
+    dist.w = static_cast<float>(cov4) * inorm_col[j + 3] * inorm_row[i];
+
+    // Update cov and compute the next distance values (row y)
+    cov1 = cov1 + df_col[j] * dg_row[i] + dg_col[j] * df_row[i];
+    cov2 = cov2 + df_col[j+1] * dg_row[i] + dg_col[j+1] * df_row[i];
+    cov3 = cov3 + df_col[j+2] * dg_row[i] + dg_col[j + 2] * df_row[i];
+    cov4 = cov4 + df_col[j+3] * dg_row[i] + dg_col[j + 3] * df_row[i];
+
+    // Update the matrix profile, see comment below for explanation
+    MPatomicMax((unsigned long long*) (local_mp_col + j), dist.x, y);
+    dist_1 = dist.x;
+    idx_1 = x;
+    if(x + 1 < n) {
+        MPMax(dist_1, dist.y, idx_1, x + 1, dist_1, idx_1);
+        MPatomicMax((unsigned long long*) (local_mp_col + j + 1), dist.y, y);
+    }
+    if(x + 2 < n) {
+        MPMax(dist_1, dist.z, idx_1, x + 2, dist_1, idx_1);
+        MPatomicMax((unsigned long long*) (local_mp_col + j + 2), dist.z, y);
+    }
+    if(x + 3 < n) {
+        MPMax(dist_1, dist.w, idx_1, x + 3, dist_1, idx_1);
+        MPatomicMax((unsigned long long*) (local_mp_col + j + 3), dist.w, y);
+    }
+    MPatomicMax((unsigned long long*) (local_mp_row + i), dist_1, idx_1);	
+}
 
 //Computes the matrix profile given the sliding dot products for the first query and the precomputed data statisics
 template<class DTYPE, unsigned int BLOCKSZ, unsigned int UNROLL_COUNT>
-__global__ void __launch_bounds__(BLOCKSZ, 512 * 3  / BLOCKSZ)
+__global__ void __launch_bounds__(BLOCKSZ, 512 * 2  / BLOCKSZ)
 WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict__ df,
                         const double* __restrict__ dg, const double* __restrict__ norms,
                         unsigned long long* __restrict__ profile, const unsigned int m,
                         const unsigned int n, int startPos, int numDevices)
 {
-    const int tile_height = 256; //BLOCKSZ / TILE_HEIGHT_ADJUSTMENT;
-    const int tile_width = tile_height + BLOCKSZ * 2;
+    const int tile_height = 64; //BLOCKSZ / TILE_HEIGHT_ADJUSTMENT;
+    const int tile_width = tile_height + BLOCKSZ * 4;
     __shared__ mp_entry local_mp_col[tile_width];
     __shared__ mp_entry local_mp_row[tile_height];
     __shared__ float df_col[tile_width];
@@ -430,13 +580,13 @@ WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict
     // The first threads are acutally computing the trivial match between the same subsequence
     // we exclude these from the calculation
     const int exclusion = (m / 4);
-    int tile_start_x = meta_diagonal_idx * (BLOCKSZ * 2) + exclusion;
+    int tile_start_x = meta_diagonal_idx * (BLOCKSZ * 4) + exclusion;
     int tile_start_y = 0;
     
     // x is the global column of the distance matrix
     // y is the global row of the distance matrix
     // localX, localY are the local coordinates of the thread position in the tile it is working on
-    int x = tile_start_x + threadIdx.x * 2;
+    int x = tile_start_x + threadIdx.x * 4;
     int y = 0;
 
     // Each thread updates 2 diagonals at once
@@ -479,22 +629,21 @@ WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict
 
         // There are 2 pathways here, most of the time we take the fast path (top), at the very end of the kernel we take the slower path (bottom)
         if(x + tile_height < n) {
-            for(int i = 0, j = threadIdx.x << 1; i < tile_height; i+=2, j+=2) {
-                do_iteration_unroll_2(i,j,x + i,y + i,n, cov1,cov2, df_col, df_row, dg_col, dg_row, inorm_col, inorm_row, local_mp_col, local_mp_row);
+            for(int i = 0, j = threadIdx.x << 2; i < tile_height; i+=4, j+=4) {
+                do_iteration_unroll_4(i,j,x + i,y + i,n, cov1,cov2,cov3,cov4,df_col, df_row, dg_col, dg_row, inorm_col, inorm_row, local_mp_col, local_mp_row);
             }
 		    x += tile_height;
             y += tile_height;
-        } else {
-            int localX = threadIdx.x << 1;
+        }  else {
+            int localX = threadIdx.x << 2;
             int localY = 0;
             while(x < n) {
-                do_iteration(localY,localX,x,y,n, cov1,cov2, df_col, df_row, dg_col, dg_row, inorm_col, inorm_row, local_mp_col, local_mp_row);
+                do_iteration_4diag(localY,localX,x,y,n, cov1,cov2,cov3,cov4, df_col, df_row, dg_col, dg_row, inorm_col, inorm_row, local_mp_col, local_mp_row);
                 ++x;
                 ++y;
                 ++localX;
                 ++localY;
             } 
-
 	    }
         // After this sync, the caches will be updated with the best so far values for this tile
         __syncthreads();
@@ -600,7 +749,7 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
     }
 
     MPIDXCombine combiner;
-    int num_workers = ceil(ceil((n - (m / 4)) / (float) devices.size()) / 2.0);
+    int num_workers = ceil(ceil((n - (m / 4)) / (float) devices.size()) / 4.0);
     
     // Asynchronously copy relevant data, precompute statistics, generate partial matrix profile
     int count = 0;
