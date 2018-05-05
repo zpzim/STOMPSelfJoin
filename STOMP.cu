@@ -244,7 +244,7 @@ void sliding_dot_products_and_distance_profile(DTYPE* T, DTYPE* Q, DTYPE *QT, DT
 
 
 
-//Atomically updates the MP/idxs using a single 64-bit integer. We lose a small amount of precision in the output, if we do not do this we are unable
+// Atomically updates the MP/idxs using a single 64-bit integer. If we do not do this we are unable
 // to atomically update both the matrix profile and the indexes without using a critical section and dedicated locks.
 __device__ inline void MPatomicMax(volatile unsigned long long int* __restrict__ address, float val, unsigned int idx)
 {
@@ -304,6 +304,7 @@ __device__ inline void MPMax(const float d1, const float d2, const unsigned int 
 
 }
 
+// Computes max(a,b) with index and stores the result in a
 __device__ inline void MPMax2(float &d1, const float &d2, unsigned int &i1,
                              const unsigned int &i2)
 {
@@ -313,6 +314,8 @@ __device__ inline void MPMax2(float &d1, const float &d2, unsigned int &i1,
     } 
 }
 
+
+// Computes the max of 4 values in a float 4
 __device__ inline float max4(const float4 &d, const unsigned int init, unsigned int &idx) {
     float ret = d.x;
     idx = init;
@@ -388,6 +391,7 @@ __device__ inline void do_iteration_unroll_2(int i, int j, int x, int y, int n, 
 }
 
 
+// This does one row of work for 4 diagonals in a single thread
 __device__ inline void do_unrolled_row4(float &cov1, float &cov2, float &cov3, float &cov4,
                                          float &distcol1, float &distcol2, float &distcol3,
                                          float &distcol4, unsigned int &idxcol1,
@@ -400,26 +404,35 @@ __device__ inline void do_unrolled_row4(float &cov1, float &cov2, float &cov3, f
                                          const float &dg_row, const int &row, const int &col,
                                          const int &global_row, const int &global_col,
                                          mp_entry* __restrict__ mp_row) {
+
     float4 dist;
+
+    // Compute the row's distances
     dist.x = static_cast<float>(cov1) * inormcx * inormr;
     dist.y = static_cast<float>(cov2) * inormcy * inormr;
     dist.z = static_cast<float>(cov3) * inormcz * inormr;
     dist.w = static_cast<float>(cov4) * inormcw * inormr;
-    // Update cov and compute the next distance values (row y)
+
+    // Compute the next covariance values
     cov1 = cov1 + df_colx * dg_row + dg_colx * df_row;
     cov2 = cov2 + df_coly * dg_row + dg_coly * df_row;
     cov3 = cov3 + df_colz * dg_row + dg_colz * df_row;
     cov4 = cov4 + df_colw * dg_row + dg_colw * df_row;
+
+    // Update the column best-so-far values
     MPMax2(distcol1, dist.x, idxcol1, global_row);
     MPMax2(distcol2, dist.y, idxcol2, global_row);
     MPMax2(distcol3, dist.z, idxcol3, global_row);
     MPMax2(distcol4, dist.w, idxcol4, global_row);
     unsigned int idx;
+
+    // We take the maximum of the columns we computed for the row
+    // And use that value to check the matrix profile
     float d = max4(dist, global_col, idx);
     MPatomicMax((unsigned long long*) (mp_row + row), d, idx);
 }
 
-// Processes an iteration of the inner loop. Each thread computes 4 distances per iteration (x,y), (x+1,y), (x+1,y+1), and (x+2,y+1)
+// Processes 4 iterations of the inner loop. Each thread computes 4 distances per iteration (x,y), (x+1,y), (x+2,y), and (x+3,y)
 // This function assumes that the edge cases that occur on the edge of the distance matrix are not present. This is the faster path,
 // with less conditional branching.
 __device__ inline void do_iteration_unroll_4(int i, int j, int x, int y, int n, float &cov1, float &cov2, float &cov3, float &cov4,
@@ -430,46 +443,74 @@ __device__ inline void do_iteration_unroll_4(int i, int j, int x, int y, int n, 
     float4 distc = make_float4(CC_MIN, CC_MIN, CC_MIN, CC_MIN);
     float4 distc2 = make_float4(CC_MIN, CC_MIN, CC_MIN, CC_MIN);
     uint4 idxc,idxc2;
+    
+    // Load row values 2 at a time, load column values 4 at a time
     int r = i >> 1;
     int c = j >> 2;
+
     // Preload the shared memory values we will use into registers
-    // We load 2 values per instruction into a float2 vector type
+    // We load 4 values per instruction into a float4 vector type
     float4 dfc = reinterpret_cast<float4*>(df_col)[c];
     float4 dgc = reinterpret_cast<float4*>(dg_col)[c];
     float4 inormc = (reinterpret_cast<float4*>(inorm_col)[c]);
     float4 dfc2 = reinterpret_cast<float4*>(df_col)[c+1];
     float4 dgc2 = reinterpret_cast<float4*>(dg_col)[c+1];
     float4 inormc2 = reinterpret_cast<float4*>(inorm_col)[c+1];
+
+    // Due to a lack of registers on volta, we only load these row values 2 at a time
     float2 dgr = reinterpret_cast<float2*>(dg_row)[r];
     float2 dfr = reinterpret_cast<float2*>(df_row)[r];
     float2 inormr = reinterpret_cast<float2*>(inorm_row)[r];
 
+    // Do rows one at a time:
+    // We are computing a tile that looks like this:
+    // C:1 2 3 4 5 6 7
+    //R1 X X X X
+    //R2   X X X X
+    //R3     X X X X
+    //R4       X X X X
+    // For 4 diagonals unrolled 4 times we compute a total of 16 distances.
+    // These distances cover 4 possible rows and 7 possible columns, so we need to check the matrix profile
+    // 11 times total, once for each row and once for each column
+    
     do_unrolled_row4(cov1, cov2, cov3, cov4, distc.x, distc.y, distc.z, distc.w,
-                     idxc.x, idxc.y, idxc.z, idxc.w, inormc.x, inormc.y, inormc.z, inormc.w,
-                     inormr.x, dfc.x, dfc.y, dfc.z, dfc.w, dgc.x, dgc.y, dgc.z, dgc.w, dfr.x, dgr.x, i, j, y, x, local_mp_row);
+                     idxc.x, idxc.y, idxc.z, idxc.w, inormc.x, inormc.y, inormc.z, 
+                     inormc.w, inormr.x, dfc.x, dfc.y, dfc.z, dfc.w, dgc.x, dgc.y,
+                     dgc.z, dgc.w, dfr.x, dgr.x, i, j, y, x, local_mp_row);
 
+    // Each row's computation allows us to complete a column, the first row completes column 1
     MPatomicMax((unsigned long long*) (local_mp_col + j), distc.x, idxc.x);
 
     do_unrolled_row4(cov1, cov2, cov3, cov4, distc.y, distc.z, distc.w, distc2.x,
-                     idxc.y, idxc.z, idxc.w, idxc2.x, inormc.y, inormc.z, inormc.w, inormc2.x,
-                     inormr.y, dfc.y, dfc.z, dfc.w, dfc2.x, dgc.y, dgc.z, dgc.w, dgc2.x, dfr.y, dgr.y, i + 1, j + 1, y + 1, x+1, local_mp_row);
+                     idxc.y, idxc.z, idxc.w, idxc2.x, inormc.y, inormc.z, inormc.w,
+                     inormc2.x, inormr.y, dfc.y, dfc.z, dfc.w, dfc2.x, dgc.y, dgc.z,
+                     dgc.w, dgc2.x, dfr.y, dgr.y, i + 1, j + 1, y + 1, x + 1,
+                     local_mp_row);
 
+    // The second row completes column 2
     MPatomicMax((unsigned long long*) (local_mp_col + j + 1), distc.y, idxc.y);
 
+    // Load the values for the next 2 rows
     dgr = reinterpret_cast<float2*>(dg_row)[r + 1];
     dfr = reinterpret_cast<float2*>(df_row)[r + 1];
     inormr = reinterpret_cast<float2*>(inorm_row)[r + 1];
 
     do_unrolled_row4(cov1, cov2, cov3, cov4, distc.z, distc.w, distc2.x, distc2.y,
-                     idxc.z, idxc.w, idxc2.x, idxc2.y, inormc.z, inormc.w, inormc2.x, inormc2.y,
-                     inormr.x, dfc.z, dfc.w, dfc2.x, dfc2.y, dgc.z, dgc.w, dgc2.x, dgc2.y, dfr.x, dgr.x, i + 2, j + 2, y+2, x+2, local_mp_row);
+                     idxc.z, idxc.w, idxc2.x, idxc2.y, inormc.z, inormc.w, inormc2.x,
+                     inormc2.y, inormr.x, dfc.z, dfc.w, dfc2.x, dfc2.y, dgc.z, dgc.w,
+                     dgc2.x, dgc2.y, dfr.x, dgr.x, i + 2, j + 2, y + 2, x + 2,
+                     local_mp_row);
 
+    // The third row completes column 3
     MPatomicMax((unsigned long long*) (local_mp_col + j + 2), distc.z, idxc.z);
 
     do_unrolled_row4(cov1, cov2, cov3, cov4, distc.w, distc2.x, distc2.y, distc2.z,
-                     idxc.w, idxc2.x, idxc2.y, idxc2.z, inormc.w, inormc2.x, inormc2.y, inormc2.z,
-                     inormr.y, dfc.w, dfc2.x, dfc2.y, dfc2.z, dgc.w, dgc2.x, dgc2.y, dgc2.z, dfr.y, dgr.y, i + 3, j + 3,y+3,x+3, local_mp_row);
-
+                     idxc.w, idxc2.x, idxc2.y, idxc2.z, inormc.w, inormc2.x, inormc2.y,
+                     inormc2.z, inormr.y, dfc.w, dfc2.x, dfc2.y, dfc2.z, dgc.w, dgc2.x,
+                     dgc2.y, dgc2.z, dfr.y, dgr.y, i + 3, j + 3, y + 3, x + 3,
+                     local_mp_row);
+   
+    // After the 4th row, we have completed columns 4, 5, 6, and 7
     MPatomicMax((unsigned long long*) (local_mp_col + j + 3), distc.w, idxc.w);
     MPatomicMax((unsigned long long*) (local_mp_col + j + 4), distc2.x, idxc2.x);
     MPatomicMax((unsigned long long*) (local_mp_col + j + 5), distc2.y, idxc2.y);
@@ -480,7 +521,7 @@ __device__ inline void do_iteration_unroll_4(int i, int j, int x, int y, int n, 
 
 // Does a single iteration of the inner loop on 2 diagonals, not unrolled
 // Checks for the boundary case where only 1 diagonal can be updated
-__device__ inline void do_iteration(int i, int j, int x, int y, int n, float &cov, float &cov2,
+__device__ inline void do_iteration_2diag(int i, int j, int x, int y, int n, float &cov, float &cov2,
                                              float *df_col, float *df_row, float *dg_col, float *dg_row,
                                              float *inorm_col, float *inorm_row, mp_entry *local_mp_col,
                                               mp_entry *local_mp_row) 
@@ -547,15 +588,16 @@ __device__ inline void do_iteration_4diag(int i, int j, int x, int y, int n, flo
 }
 
 //Computes the matrix profile given the sliding dot products for the first query and the precomputed data statisics
-template<class DTYPE, unsigned int BLOCKSZ, unsigned int UNROLL_COUNT>
+template<class DTYPE, unsigned int BLOCKSZ>
 __global__ void __launch_bounds__(BLOCKSZ, 512 * 2  / BLOCKSZ)
 WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict__ df,
                         const double* __restrict__ dg, const double* __restrict__ norms,
                         unsigned long long* __restrict__ profile, const unsigned int m,
                         const unsigned int n, int startPos, int numDevices)
 {
-    // tile height must be a multiple of 4
-    const int tile_height = 200; //BLOCKSZ / TILE_HEIGHT_ADJUSTMENT;
+    // tile_height must be a multiple of 4
+    // Tuned for V100
+    const int tile_height = 200;
     const int tile_width = tile_height + BLOCKSZ * 4;
     __shared__ mp_entry local_mp_col[tile_width];
     __shared__ mp_entry local_mp_row[tile_height];
@@ -590,11 +632,11 @@ WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict
     }
     
     if (x + 1 < n) {
-	    cov2 = Cov[x + 1];
+        cov2 = Cov[x + 1];
     }
     
     if (x + 2 < n) {
-	    cov3 = Cov[x + 2];
+        cov3 = Cov[x + 2];
     }
 
     if(x + 3 < n) {
@@ -619,14 +661,15 @@ WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict
         // Start of new tile, sync
         __syncthreads();
 
-        // There are 2 pathways here, most of the time we take the fast path (top), at the very end of the kernel we take the slower path (bottom)
+        // There are 2 pathways here, most of the time we take the fast path (top),
+        // the last block will take the slower path as well as the fast path (bottom)
         if(x + tile_height < n) {
             for(int i = 0, j = threadIdx.x << 2; i < tile_height; i+=4, j+=4) {
                 do_iteration_unroll_4(i,j,x + i,y + i,n, cov1,cov2,cov3,cov4,df_col, df_row, dg_col, dg_row, inorm_col, inorm_row, local_mp_col, local_mp_row);
             }
-		    x += tile_height;
+            x += tile_height;
             y += tile_height;
-        }  else {
+        } else {
             int localX = threadIdx.x << 2;
             int localY = 0;
             while(x < n) {
@@ -636,7 +679,8 @@ WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict
                 ++localX;
                 ++localY;
             } 
-	    }
+        }
+
         // After this sync, the caches will be updated with the best so far values for this tile
         __syncthreads();
 
@@ -654,7 +698,7 @@ WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict
         local_position = threadIdx.x;
         while(local_position < tile_height && global_position < n) {
             mp_entry e = local_mp_row[local_position];
-        	MPatomicMax(profile + global_position, e.floats[0], e.ints[1]);
+            MPatomicMax(profile + global_position, e.floats[0], e.ints[1]);
             global_position += BLOCKSZ;
             local_position += BLOCKSZ;
         }
@@ -760,12 +804,12 @@ void do_STOMP(const vector<DTYPE> &T_h, vector<float> &profile_h, vector<unsigne
          
         thrust::device_ptr<unsigned long long int> ptr = thrust::device_pointer_cast(profile_merged[device]);
         thrust::transform(thrust::cuda::par.on(streams.at(device)), profile_dev[device], profile_dev[device] + n, profile_idx_dev[device], profile_merged[device], combiner);
-        cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
+        //cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
         gpuErrchk(cudaPeekAtLastError());
         printf("Start main kernel on GPU %d\n", device);
 
         cudaEventRecord(clocks_start[device], streams.at(device));
-        WavefrontUpdateSelfJoin<float, WORK_SIZE, AMT_UNROLL><<<dim3(ceil(num_workers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1), 0, streams.at(device)>>>(QT_dev[device], df[device], dg[device], norms[device], profile_merged[device], m, n, count, devices.size());
+        WavefrontUpdateSelfJoin<float, WORK_SIZE><<<dim3(ceil(num_workers / (double) WORK_SIZE), 1, 1),dim3(WORK_SIZE, 1,1), 0, streams.at(device)>>>(QT_dev[device], df[device], dg[device], norms[device], profile_merged[device], m, n, count, devices.size());
         cudaEventRecord(clocks_end[device], streams.at(device));
         ++count;
     }
