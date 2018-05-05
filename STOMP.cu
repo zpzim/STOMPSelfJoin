@@ -25,22 +25,6 @@ using std::make_pair;
 
 static const unsigned int WORK_SIZE = 512;
 
-// These parameters must be tuned for a specific architecture
-
-// By default they are tuned for Volta (V100)
-static const unsigned int AMT_UNROLL = 2;
-static const unsigned int TILE_HEIGHT_ADJUSTMENT = 2;
-
-//Pascal (P100)
-//static const unsigned int AMT_UNROLL = 16;
-//static const unsigned int TILE_HEIGHT_ADJUSTMENT = 2;
-
-// Kepler (K80/K40/K20)
-// on Kepler, these parameters do not affect the runtime as much because the bottleneck
-// is elsewhere
-//static const unsigned int AMT_UNROLL = 4;
-//static const unsigned int TILE_HEIGHT_ADJUSTMENT = 4;
-
 //This macro checks return value of the CUDA runtime call and exits
 //the application if the call failed.
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
@@ -350,7 +334,7 @@ __device__ inline float max4(const float4 &d, const unsigned int init, unsigned 
 // Processes an iteration of the inner loop. Each thread computes 4 distances per iteration (x,y), (x+1,y), (x+1,y+1), and (x+2,y+1)
 // This function assumes that the edge cases that occur on the edge of the distance matrix are not present. This is the faster path,
 // with less conditional branching.
-__device__ inline void do_iteration_unroll_2(int i, int j, int x, int y, int n, double &cov, double &cov2,
+__device__ inline void do_iteration_unroll_2(int i, int j, int x, int y, int n, float &cov, float &cov2,
                                              float *df_col, float *df_row, float *dg_col, float *dg_row,
                                              float *inorm_col, float *inorm_row, mp_entry *local_mp_col,
                                               mp_entry *local_mp_row) 
@@ -404,7 +388,7 @@ __device__ inline void do_iteration_unroll_2(int i, int j, int x, int y, int n, 
 }
 
 
-__device__ inline void do_unrolled_row4(double &cov1, double &cov2, double &cov3, double &cov4,
+__device__ inline void do_unrolled_row4(float &cov1, float &cov2, float &cov3, float &cov4,
                                          float &distcol1, float &distcol2, float &distcol3,
                                          float &distcol4, unsigned int &idxcol1,
                                          unsigned int &idxcol2, unsigned int &idxcol3, unsigned int &idxcol4,
@@ -438,7 +422,7 @@ __device__ inline void do_unrolled_row4(double &cov1, double &cov2, double &cov3
 // Processes an iteration of the inner loop. Each thread computes 4 distances per iteration (x,y), (x+1,y), (x+1,y+1), and (x+2,y+1)
 // This function assumes that the edge cases that occur on the edge of the distance matrix are not present. This is the faster path,
 // with less conditional branching.
-__device__ inline void do_iteration_unroll_4(int i, int j, int x, int y, int n, double &cov1, double &cov2, double &cov3, double& cov4,
+__device__ inline void do_iteration_unroll_4(int i, int j, int x, int y, int n, float &cov1, float &cov2, float &cov3, float &cov4,
                                              float* __restrict__ df_col, float* __restrict__ df_row, float* __restrict__ dg_col,
                                              float* __restrict__ dg_row, float* __restrict__ inorm_col, float* __restrict__ inorm_row,
                                              mp_entry* __restrict__ local_mp_col, mp_entry* __restrict__ local_mp_row) 
@@ -496,7 +480,7 @@ __device__ inline void do_iteration_unroll_4(int i, int j, int x, int y, int n, 
 
 // Does a single iteration of the inner loop on 2 diagonals, not unrolled
 // Checks for the boundary case where only 1 diagonal can be updated
-__device__ inline void do_iteration(int i, int j, int x, int y, int n, double &cov, double &cov2,
+__device__ inline void do_iteration(int i, int j, int x, int y, int n, float &cov, float &cov2,
                                              float *df_col, float *df_row, float *dg_col, float *dg_row,
                                              float *inorm_col, float *inorm_row, mp_entry *local_mp_col,
                                               mp_entry *local_mp_row) 
@@ -523,8 +507,8 @@ __device__ inline void do_iteration(int i, int j, int x, int y, int n, double &c
 
 // Does a single iteration of the inner loop on 4 diagonals per thread, not unrolled
 // Checks for the boundary case where only 1, 2, or 3 diagonals can be updated
-__device__ inline void do_iteration_4diag(int i, int j, int x, int y, int n, double &cov1, double &cov2,
-                                          double &cov3, double &cov4, float *df_col, float *df_row,
+__device__ inline void do_iteration_4diag(int i, int j, int x, int y, int n, float &cov1, float &cov2,
+                                          float &cov3, float &cov4, float *df_col, float *df_row,
                                           float *dg_col, float *dg_row, float *inorm_col, float *inorm_row,
                                           mp_entry *local_mp_col, mp_entry *local_mp_row) 
 {
@@ -570,7 +554,8 @@ WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict
                         unsigned long long* __restrict__ profile, const unsigned int m,
                         const unsigned int n, int startPos, int numDevices)
 {
-    const int tile_height = 64; //BLOCKSZ / TILE_HEIGHT_ADJUSTMENT;
+    // tile height must be a multiple of 4
+    const int tile_height = 200; //BLOCKSZ / TILE_HEIGHT_ADJUSTMENT;
     const int tile_width = tile_height + BLOCKSZ * 4;
     __shared__ mp_entry local_mp_col[tile_width];
     __shared__ mp_entry local_mp_row[tile_height];
@@ -597,7 +582,7 @@ WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict
     int y = 0;
 
     // Each thread updates 2 diagonals at once
-    double cov1, cov2, cov3, cov4;
+    float cov1, cov2, cov3, cov4;
     
     // Load the first dot product values
     if (x < n) {
