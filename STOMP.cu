@@ -329,16 +329,20 @@ __device__ inline void MPMax2(float &d1, const float &d2, unsigned int &i1,
     } 
 }
 
-__device__ inline float max4(const float4 &d) {
+__device__ inline float max4(const float4 &d, const unsigned int init, unsigned int &idx) {
     float ret = d.x;
+    idx = init;
     if(d.y > ret) {
         ret = d.y;
+        idx = init + 1;
     }
     if(d.z > ret) {
         ret = d.z;
+        idx = init + 2;
     }
     if(d.w > ret) {
         ret = d.w;
+        idx = init + 3;
     }
     return ret;
 }
@@ -410,6 +414,7 @@ __device__ inline void do_unrolled_row4(double &cov1, double &cov2, double &cov3
                                          const float &df_colw, const float &dg_colx, const float &dg_coly,
                                          const float &dg_colz, const float &dg_colw, const float &df_row,
                                          const float &dg_row, const int &row, const int &col,
+                                         const int &global_row, const int &global_col,
                                          mp_entry* __restrict__ mp_row) {
     float4 dist;
     dist.x = static_cast<float>(cov1) * inormcx * inormr;
@@ -421,11 +426,13 @@ __device__ inline void do_unrolled_row4(double &cov1, double &cov2, double &cov3
     cov2 = cov2 + df_coly * dg_row + dg_coly * df_row;
     cov3 = cov3 + df_colz * dg_row + dg_colz * df_row;
     cov4 = cov4 + df_colw * dg_row + dg_colw * df_row;
-    MPMax2(distcol1, dist.x, idxcol1, col);
-    MPMax2(distcol2, dist.y, idxcol2, col + 1);
-    MPMax2(distcol3, dist.z, idxcol3, col + 2);
-    MPMax2(distcol4, dist.w, idxcol4, col + 3);
-    MPatomicMax((unsigned long long*) (mp_row + row), max4(dist), row);
+    MPMax2(distcol1, dist.x, idxcol1, global_row);
+    MPMax2(distcol2, dist.y, idxcol2, global_row);
+    MPMax2(distcol3, dist.z, idxcol3, global_row);
+    MPMax2(distcol4, dist.w, idxcol4, global_row);
+    unsigned int idx;
+    float d = max4(dist, global_col, idx);
+    MPatomicMax((unsigned long long*) (mp_row + row), d, idx);
 }
 
 // Processes an iteration of the inner loop. Each thread computes 4 distances per iteration (x,y), (x+1,y), (x+1,y+1), and (x+2,y+1)
@@ -455,13 +462,13 @@ __device__ inline void do_iteration_unroll_4(int i, int j, int x, int y, int n, 
 
     do_unrolled_row4(cov1, cov2, cov3, cov4, distc.x, distc.y, distc.z, distc.w,
                      idxc.x, idxc.y, idxc.z, idxc.w, inormc.x, inormc.y, inormc.z, inormc.w,
-                     inormr.x, dfc.x, dfc.y, dfc.z, dfc.w, dgc.x, dgc.y, dgc.z, dgc.w, dfr.x, dgr.x, i, j, local_mp_row);
+                     inormr.x, dfc.x, dfc.y, dfc.z, dfc.w, dgc.x, dgc.y, dgc.z, dgc.w, dfr.x, dgr.x, i, j, y, x, local_mp_row);
 
     MPatomicMax((unsigned long long*) (local_mp_col + j), distc.x, idxc.x);
 
     do_unrolled_row4(cov1, cov2, cov3, cov4, distc.y, distc.z, distc.w, distc2.x,
                      idxc.y, idxc.z, idxc.w, idxc2.x, inormc.y, inormc.z, inormc.w, inormc2.x,
-                     inormr.y, dfc.y, dfc.z, dfc.w, dfc2.x, dgc.y, dgc.z, dgc.w, dgc2.x, dfr.y, dgr.y, i + 1, j + 1, local_mp_row);
+                     inormr.y, dfc.y, dfc.z, dfc.w, dfc2.x, dgc.y, dgc.z, dgc.w, dgc2.x, dfr.y, dgr.y, i + 1, j + 1, y + 1, x+1, local_mp_row);
 
     MPatomicMax((unsigned long long*) (local_mp_col + j + 1), distc.y, idxc.y);
 
@@ -471,13 +478,13 @@ __device__ inline void do_iteration_unroll_4(int i, int j, int x, int y, int n, 
 
     do_unrolled_row4(cov1, cov2, cov3, cov4, distc.z, distc.w, distc2.x, distc2.y,
                      idxc.z, idxc.w, idxc2.x, idxc2.y, inormc.z, inormc.w, inormc2.x, inormc2.y,
-                     inormr.x, dfc.z, dfc.w, dfc2.x, dfc2.y, dgc.z, dgc.w, dgc2.x, dgc2.y, dfr.x, dgr.x, i + 2, j + 2, local_mp_row);
+                     inormr.x, dfc.z, dfc.w, dfc2.x, dfc2.y, dgc.z, dgc.w, dgc2.x, dgc2.y, dfr.x, dgr.x, i + 2, j + 2, y+2, x+2, local_mp_row);
 
     MPatomicMax((unsigned long long*) (local_mp_col + j + 2), distc.z, idxc.z);
 
     do_unrolled_row4(cov1, cov2, cov3, cov4, distc.w, distc2.x, distc2.y, distc2.z,
                      idxc.w, idxc2.x, idxc2.y, idxc2.z, inormc.w, inormc2.x, inormc2.y, inormc2.z,
-                     inormr.y, dfc.w, dfc2.x, dfc2.y, dfc2.z, dgc.w, dgc2.x, dgc2.y, dgc2.z, dfr.y, dgr.y, i + 3, j + 3, local_mp_row);
+                     inormr.y, dfc.w, dfc2.x, dfc2.y, dfc2.z, dgc.w, dgc2.x, dgc2.y, dgc2.z, dfr.y, dgr.y, i + 3, j + 3,y+3,x+3, local_mp_row);
 
     MPatomicMax((unsigned long long*) (local_mp_col + j + 3), distc.w, idxc.w);
     MPatomicMax((unsigned long long*) (local_mp_col + j + 4), distc2.x, idxc2.x);
