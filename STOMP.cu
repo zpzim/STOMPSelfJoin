@@ -663,7 +663,7 @@ WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict
 
         // There are 2 pathways here, most of the time we take the fast path (top),
         // the last block will take the slower path as well as the fast path (bottom)
-        if(x + tile_height < n) {
+        if(tile_start_x + tile_width < n) {
             for(int i = 0, j = threadIdx.x << 2; i < tile_height; i+=4, j+=4) {
                 do_iteration_unroll_4(i,j,x + i,y + i,n, cov1,cov2,cov3,cov4,df_col, df_row, dg_col, dg_row, inorm_col, inorm_row, local_mp_col, local_mp_row);
             }
@@ -672,7 +672,7 @@ WavefrontUpdateSelfJoin(const double* __restrict__ Cov, const double* __restrict
         } else {
             int localX = threadIdx.x << 2;
             int localY = 0;
-            while(x < n) {
+            while(x < n && localY < tile_height) {
                 do_iteration_4diag(localY,localX,x,y,n, cov1,cov2,cov3,cov4, df_col, df_row, dg_col, dg_row, inorm_col, inorm_row, local_mp_col, local_mp_row);
                 ++x;
                 ++y;
