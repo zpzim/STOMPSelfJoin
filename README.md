@@ -1,5 +1,6 @@
 # STOMPSelfJoin
 This is a GPU implementation of the STOMP algorithm. STOMP takes a time series as input and computes the matrix profile for a particular window size. You can read more at the [Matrix Profile Homepage](http://www.cs.ucr.edu/~eamonn/MatrixProfile.html)
+
 For additional features and better performance you should use [SCAMP](http://github.com/zpzim/SCAMP)
 # Environment
 This base project requires:
